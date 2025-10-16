@@ -1,0 +1,20 @@
+repository:
+  name: "grand-central"
+  url: "https://github.com/nilenso/grand-central"
+  revision: "c0b34b1f25c4f9d503262d8256e2c2f9caaab275"
+  prd: "/data/grand_central/prd.md"
+  tech_spec: "/data/grand_central/tech-spec.md"
+
+setup:
+  commands:
+    - "echo $PATH"
+    - "curl https://mise.run | sh"
+    - eval "$(~/.local/bin/mise activate bash --shims)"
+    - "~/.local/bin/mise use node@18"
+    - "~/.local/bin/mise doctor"
+    - "node -v"
+    - "npm install"
+    - "npm run setup"
+
+  env:
+    DATABASE_URL: "file:./sqlite.db"
