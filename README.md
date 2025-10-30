@@ -1,6 +1,6 @@
 # UsefulCodeBench
 
-UsefulCodeBench is a benchmark harness that executes StoryMachine-driven coding tasks end-to-end. It clones target repositories, generates implementation stories, applies Claude-based automation to implement/evaluate each story, and stores the resulting artifacts for later analysis.
+UsefulCodeBench is a benchmark harness that executes StoryMachine-driven coding tasks end-to-end. It clones target repositories, generates implementation stories, applies LLM-based automation to implement/evaluate each story, and stores the resulting artifacts for later analysis.
 
 ## Repository layout
 
@@ -14,12 +14,16 @@ UsefulCodeBench is a benchmark harness that executes StoryMachine-driven coding 
 ## Prerequisites
 
 1. **Docker**: The benchmark executes inside a container. Install Docker Engine 24.x or newer.
-2. **Anthropic Claude credentials**:
-   - `~/.claude.json`
-   - `~/.claude/`
-   These are mounted read-only into the container for both implementer and evaluator agents.
+2. **LLM Provider credentials**: Set `LLM_API_KEY` in your `.env` file. Optionally set `LLM_BASE_URL` to use providers like OpenRouter, OpenAI, or other LiteLLM-compatible services.
 3. **GitHub credentials**: Set `GIT_TOKEN` in your environment or `.env` file. The token must have `repo` scope for private GitHub repositories.
-4. **Optional `.env` file**: Create a `.env` at the repository root to provide additional environment variables consumed by the benchmark runner (for example Anthropic API keys, model overrides, etc.). The file is passed directly to `docker run --env-file`.
+4. **Required `.env` file**: Create a `.env` at the repository root with your LLM credentials and optional configuration:
+   ```bash
+   LLM_API_KEY=your-api-key-here
+   LLM_BASE_URL=https://openrouter.ai/api/v1  # Optional, for non-Anthropic providers
+   IMPLEMENTER_MODEL=anthropic/claude-3-5-haiku-20241022
+   EVALUATOR_MODEL=anthropic/claude-3-5-sonnet-20241022
+   ```
+   The file is passed directly to `docker run --env-file`.
 
 ## Build the benchmark runner image
 
@@ -29,7 +33,7 @@ Run the Docker build from the repository root:
 docker build -t benchmark-runner .
 ```
 
-This image contains all Python dependencies, Claude CLI, Playwright, and utility binaries required by the benchmark.
+This image contains all Python dependencies, Openhands SDK, Playwright, and utility binaries required by the benchmark.
 
 ## Running benchmarks via helper script
 
@@ -43,7 +47,7 @@ The script performs the following for each YAML file in `data/`:
 
 1. Creates a timestamped results directory under `results/` (or `$RESULTS_DIR`).
 2. Launches `docker run` with the appropriate mounts and environment variables.
-3. Forwards credentials (`GIT_TOKEN`, Claude state) and optional variables from `.env`.
+3. Forwards credentials (`GIT_TOKEN`) and LLM configuration from `.env`.
 
 ### Environment overrides
 
@@ -55,22 +59,28 @@ The script honors the following variables for advanced usage:
 | `CONFIG_DIR` | `<repo>/config` | Location of shared benchmark configs |
 | `RESULTS_DIR` | `<repo>/results` | Host directory that receives results |
 | `BENCHMARK_IMAGE` | `benchmark-runner` | Docker image name to execute |
-| `CLAUDE_JSON_PATH` | `$HOME/.claude.json` | Path to Claude credentials JSON |
-| `CLAUDE_DIR_PATH` | `$HOME/.claude` | Directory with Claude session state |
-| `BENCHMARK_ENV_FILE` | `<repo>/.env` | Extra environment variables to pass via `--env-file` |
+| `BENCHMARK_ENV_FILE` | `<repo>/.env` | Environment variables (LLM credentials, etc.) to pass via `--env-file` |
 
 To run a single repository configuration, point `DATA_DIR` at a directory containing just the target YAML file.
 
-### Required host secrets
+### Required environment configuration
 
-The script checks for Claude credential files. It does **not** verify `GIT_TOKEN`—set it explicitly before running:
+Ensure your `.env` file contains `LLM_API_KEY`. The script does **not** verify credentials before running, but the benchmark will fail without them:
 
-```/dev/null/README_env.sh#L1-3
-export GIT_TOKEN=ghp_your_token_here
-./scripts/run_benchmark.sh
+```bash
+# .env file example
+LLM_API_KEY=your-api-key-here
+GIT_TOKEN=ghp_your_token_here
+
+# Optional: Use OpenRouter or other providers
+LLM_BASE_URL=https://openrouter.ai/api/v1
+
+# Optional: Override default models
+IMPLEMENTER_MODEL=anthropic/claude-3-5-haiku-20241022
+EVALUATOR_MODEL=anthropic/claude-3-5-sonnet-20241022
 ```
 
-Avoid hardcoding secrets inside version-controlled files.
+Avoid committing `.env` to version control—add it to `.gitignore`.
 
 ## Understanding repository configurations
 
@@ -109,12 +119,12 @@ Key sections:
 1. Clone the configured repository and checkout the specified revision.
 2. Execute any setup commands (capturing exported environment variables).
 3. Generate stories via StoryMachine using `config/storymachine.yaml`.
-4. Delegate implementation & evaluation to Claude agents.
+4. Delegate implementation & evaluation to LLM agents via Openhands SDK.
 5. Save results, logs, and intermediate artifacts to `/results` (mounted from host).
 
 Useful artifacts produced per story:
 
-- `<story>.implement.jsonl` / `<story>.evaluate.jsonl`: Streaming Claude transcripts.
+- `<story>.implement.jsonl` / `<story>.evaluate.jsonl`: Streaming agent event transcripts.
 - `<story>.result.md`: Final evaluation report captured from `result.md` in the repo.
 - Updated repository state committed to a local branch inside the container for traceability.
 
@@ -131,8 +141,9 @@ Ensure you have the same system dependencies installed as the Docker image (git,
 
 ## Troubleshooting
 
-- **Missing Claude credentials**: The helper script will abort if `~/.claude.json` or `~/.claude/` are absent.
-- **Git credential issues**: Confirm `GIT_TOKEN` is exported before running; private repositories require this token.
+- **Missing LLM credentials**: Ensure `LLM_API_KEY` is set in your `.env` file. The benchmark will fail immediately if credentials are missing.
+- **Provider-specific errors**: If using OpenRouter or non-Anthropic providers, verify `LLM_BASE_URL` is correct and model names match your provider's format.
+- **Git credential issues**: Confirm `GIT_TOKEN` is set in `.env` or exported; private repositories require this token.
 - **StoryMachine failures**: Validate `config/storymachine.yaml` and ensure the packaged version referenced in the config exists.
 - **Setup command failures**: The runner halts on the first non-zero exit. Re-run the benchmark after addressing the underlying issue inside the target repository.
 

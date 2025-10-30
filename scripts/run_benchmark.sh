@@ -8,8 +8,6 @@ DATA_DIR=${DATA_DIR:-"${REPO_ROOT}/data"}
 CONFIG_DIR=${CONFIG_DIR:-"${REPO_ROOT}/config"}
 RESULTS_ROOT=${RESULTS_DIR:-"${REPO_ROOT}/results"}
 ENV_FILE=${BENCHMARK_ENV_FILE:-"${REPO_ROOT}/.env"}
-CLAUDE_JSON_PATH=${CLAUDE_JSON_PATH:-"${HOME}/.claude.json"}
-CLAUDE_DIR_PATH=${CLAUDE_DIR_PATH:-"${HOME}/.claude"}
 IMAGE_NAME=${BENCHMARK_IMAGE:-"benchmark-runner"}
 
 # Ensure required directories and files exist
@@ -20,16 +18,6 @@ fi
 
 if [[ ! -d "${CONFIG_DIR}" ]]; then
     echo "Expected config directory at ${CONFIG_DIR}" >&2
-    exit 1
-fi
-
-if [[ ! -f "${CLAUDE_JSON_PATH}" ]]; then
-    echo "Expected Claude credentials file at ${CLAUDE_JSON_PATH}" >&2
-    exit 1
-fi
-
-if [[ ! -d "${CLAUDE_DIR_PATH}" ]]; then
-    echo "Expected Claude state directory at ${CLAUDE_DIR_PATH}" >&2
     exit 1
 fi
 
@@ -59,8 +47,6 @@ for repo_data in "${repo_files[@]}"; do
         "-v" "${DATA_DIR}:/data:ro"
         "-v" "${CONFIG_DIR}:/config:ro"
         "-v" "${run_dir}:/results"
-        "-v" "${CLAUDE_JSON_PATH}:/home/bencher/.claude.json:ro"
-        "-v" "${CLAUDE_DIR_PATH}:/home/bencher/.claude"
         "-e" "REPO_CONFIG=/data/${repo_rel}"
         "-e" "STORYMACHINE_CONFIG=/config/storymachine.yaml"
         "-e" "RESULTS_DIR=/results"
