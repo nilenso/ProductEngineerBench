@@ -5,19 +5,10 @@ import subprocess
 from pathlib import Path
 
 import yaml
-from claude_agent_sdk import (
-    AssistantMessage,
-    ClaudeAgentOptions,
-    ClaudeSDKClient,
-    ResultMessage,
-    UserMessage,
-)
-from claude_agent_sdk.types import (
-    TextBlock,
-    ThinkingBlock,
-    ToolResultBlock,
-    ToolUseBlock,
-)
+from pydantic import SecretStr
+
+from openhands.sdk import LLM, Conversation
+from openhands.tools.preset.default import get_default_agent
 
 
 class CodeImplementationError(Exception):
@@ -159,56 +150,133 @@ class BenchmarkRunner:
 
     async def implement_story(
         self, cwd: Path, story: str, story_name: str
-    ) -> ResultMessage | None:
+    ) -> None:
         self.current_story_name = story_name
-        options = ClaudeAgentOptions(
-            system_prompt={"type": "preset", "preset": "claude_code"},
-            max_turns=100,
-            permission_mode="bypassPermissions",
-            cwd=cwd,
+
+        # Configure LLM
+        api_key = os.environ.get("LLM_API_KEY")
+        if not api_key:
+            raise ValueError("LLM_API_KEY environment variable not set")
+
+        base_url = os.environ.get("LLM_BASE_URL")
+
+        llm = LLM(
             model=self.implementer_model,
+            api_key=SecretStr(api_key),
+            base_url=base_url,
+            usage_id="implementer",
         )
-        async with ClaudeSDKClient(options) as client:
-            # Send nonstreaming input
-            prompt_path = Path(__file__).parent / "prompts" / "implementation.txt"
-            user_message = prompt_path.read_text().format(story=story)
-            await client.query(user_message)
-            await self.log_message("implement", UserMessage(content=user_message))
 
-            # Process responses
-            async for message in client.receive_response():
-                await self.log_message("implement", message)
-                self.print_message_human_readable(message)
+        # Create agent with default tools
+        agent = get_default_agent(llm=llm, cli_mode=True)
 
-                if isinstance(message, ResultMessage) and message.subtype != "success":
-                    raise CodeImplementationError(
-                        f"Code implementation failed: {message}"
-                    )
+        # Prepare user message
+        prompt_path = Path(__file__).parent / "prompts" / "implementation.txt"
+        user_message = prompt_path.read_text().format(story=story)
+
+        # Track events and errors
+        events_log = []
+        has_error = False
+
+        def event_callback(event):
+            """Callback to capture events during conversation"""
+            nonlocal has_error
+            events_log.append(event)
+
+            # Log and print event
+            asyncio.create_task(self.log_message("implement", event))
+            self.print_event_human_readable(event)
+
+            # Check for errors or failures
+            event_dict = event.to_dict() if hasattr(event, 'to_dict') else {}
+            if event_dict.get('source') == 'agent' and 'error' in str(event_dict).lower():
+                has_error = True
+
+        # Create conversation with callback
+        conversation = Conversation(
+            agent=agent,
+            workspace=str(cwd),
+            callbacks=[event_callback],
+        )
+
+        # Log user message
+        await self.log_message("implement", {"type": "user", "content": user_message})
+
+        # Send message and run conversation
+        conversation.send_message(user_message)
+
+        # Run in executor since conversation.run() is synchronous
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, conversation.run)
+
+        # Check for errors
+        if has_error:
+            raise CodeImplementationError("Code implementation failed with errors")
 
     async def evaluate_acceptance_criteria(
         self, cwd: Path, story: str, story_name: str
-    ) -> ResultMessage | None:
+    ) -> None:
         self.current_story_name = story_name
-        options = ClaudeAgentOptions(
-            max_turns=100,
-            permission_mode="bypassPermissions",
-            cwd=cwd,
+
+        # Configure LLM
+        api_key = os.environ.get("LLM_API_KEY")
+        if not api_key:
+            raise ValueError("LLM_API_KEY environment variable not set")
+
+        base_url = os.environ.get("LLM_BASE_URL")
+
+        llm = LLM(
             model=self.evaluator_model,
+            api_key=SecretStr(api_key),
+            base_url=base_url,
+            usage_id="evaluator",
         )
-        async with ClaudeSDKClient(options) as client:
-            # Send nonstreaming input
-            prompt_path = Path(__file__).parent / "prompts" / "evaluation.txt"
-            user_message = prompt_path.read_text().format(story=story)
-            await client.query(user_message)
-            await self.log_message("evaluate", UserMessage(content=user_message))
 
-            # Process responses
-            async for message in client.receive_response():
-                await self.log_message("evaluate", message)
-                self.print_message_human_readable(message)
+        # Create agent with default tools
+        agent = get_default_agent(llm=llm, cli_mode=True)
 
-                if isinstance(message, ResultMessage) and message.subtype != "success":
-                    raise UATEvaluationError(f"UAT evaluation failed: {message}")
+        # Prepare user message
+        prompt_path = Path(__file__).parent / "prompts" / "evaluation.txt"
+        user_message = prompt_path.read_text().format(story=story)
+
+        # Track events and errors
+        events_log = []
+        has_error = False
+
+        def event_callback(event):
+            """Callback to capture events during conversation"""
+            nonlocal has_error
+            events_log.append(event)
+
+            # Log and print event
+            asyncio.create_task(self.log_message("evaluate", event))
+            self.print_event_human_readable(event)
+
+            # Check for errors or failures
+            event_dict = event.to_dict() if hasattr(event, 'to_dict') else {}
+            if event_dict.get('source') == 'agent' and 'error' in str(event_dict).lower():
+                has_error = True
+
+        # Create conversation with callback
+        conversation = Conversation(
+            agent=agent,
+            workspace=str(cwd),
+            callbacks=[event_callback],
+        )
+
+        # Log user message
+        await self.log_message("evaluate", {"type": "user", "content": user_message})
+
+        # Send message and run conversation
+        conversation.send_message(user_message)
+
+        # Run in executor since conversation.run() is synchronous
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, conversation.run)
+
+        # Check for errors
+        if has_error:
+            raise UATEvaluationError("UAT evaluation failed with errors")
 
     async def run_benchmark(self):
         """Run implementation + evaluation for all stories"""
@@ -229,15 +297,14 @@ class BenchmarkRunner:
             try:
                 with open(os.path.join(self.stories_dir, story_file), "r") as f:
                     story_text = f.read()
-                    print(f"Running claude for story: {story_file}")
+                    print(f"Running agent for story: {story_file}")
                     await self.implement_story(
                         cwd=self.repo_dir, story=story_text, story_name=story_file
                     )
                     self.add_and_commit_changes(f"Implement story: {story_file}")
-                    result = await self.evaluate_acceptance_criteria(
+                    await self.evaluate_acceptance_criteria(
                         cwd=self.repo_dir, story=story_text, story_name=story_file
                     )
-                    print(result)
 
                     if result_file.exists():
                         destination_file.write_text(result_file.read_text())
@@ -248,14 +315,14 @@ class BenchmarkRunner:
                 destination_file.write_text(f"Result: Fail\n\n{e}")
                 break
 
-    async def log_message(self, phase: str, message):
-        """Log Claude messages to JSONL file"""
+    async def log_message(self, phase: str, event):
+        """Log Openhands events to JSONL file"""
         if self.current_story_name is None:
             return
 
         log_file = self.results_dir / f"{self.current_story_name}.{phase}.jsonl"
 
-        # Serializer for message blocks
+        # Serializer for event objects
         def _to_jsonable(obj):
             from dataclasses import asdict, is_dataclass
 
@@ -265,30 +332,10 @@ class BenchmarkRunner:
                 return [_to_jsonable(x) for x in obj]
             if isinstance(obj, dict):
                 return {str(_to_jsonable(k)): _to_jsonable(v) for k, v in obj.items()}
-            if isinstance(obj, TextBlock):
-                return {"type": "text", "text": getattr(obj, "text", "")}
-            if isinstance(obj, ToolUseBlock):
-                return {
-                    "type": "tool_use",
-                    "id": getattr(obj, "id", ""),
-                    "name": getattr(obj, "name", ""),
-                    "input": _to_jsonable(getattr(obj, "input", {})),
-                }
-            if isinstance(obj, ToolResultBlock):
-                return {
-                    "type": "tool_result",
-                    "tool_use_id": getattr(obj, "tool_use_id", ""),
-                    "content": _to_jsonable(getattr(obj, "content", None)),
-                    "is_error": getattr(obj, "is_error", None),
-                }
-            if isinstance(obj, ThinkingBlock):
-                return {
-                    "type": "thinking",
-                    "thinking": getattr(obj, "thinking", ""),
-                    "signature": getattr(obj, "signature", ""),
-                }
             if is_dataclass(obj) and not isinstance(obj, type):
                 return _to_jsonable(asdict(obj))
+            if hasattr(obj, "to_dict"):
+                return _to_jsonable(obj.to_dict())
             if hasattr(obj, "__dict__"):
                 return _to_jsonable(vars(obj))
             try:
@@ -297,83 +344,66 @@ class BenchmarkRunner:
             except TypeError:
                 return str(obj)
 
-        # Convert message to serializable format
+        # Convert event to serializable format
         log_entry = {
-            "type": type(message).__name__,
+            "type": type(event).__name__,
             "timestamp": asyncio.get_event_loop().time(),
         }
 
-        if isinstance(message, UserMessage):
-            log_entry["content"] = _to_jsonable(message.content)
-        elif isinstance(message, AssistantMessage):
-            # Handle different block types in assistant message
-            content = []
-            for block in message.content:
-                if isinstance(block, TextBlock):
-                    content.append({"type": "text", "text": block.text})
-                elif isinstance(block, ToolUseBlock):
-                    content.append(
-                        {
-                            "type": "tool_use",
-                            "id": getattr(block, "id", ""),
-                            "name": getattr(block, "name", ""),
-                            "input": _to_jsonable(getattr(block, "input", {})),
-                        }
-                    )
-                elif isinstance(block, ToolResultBlock):
-                    content.append(
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": getattr(block, "tool_use_id", ""),
-                            "content": _to_jsonable(getattr(block, "content", None)),
-                            "is_error": getattr(block, "is_error", None),
-                        }
-                    )
-                elif isinstance(block, ThinkingBlock):
-                    content.append(
-                        {
-                            "type": "thinking",
-                            "thinking": getattr(block, "thinking", ""),
-                            "signature": getattr(block, "signature", ""),
-                        }
-                    )
-                else:
-                    content.append(_to_jsonable(block))
-            log_entry["content"] = content
-        elif isinstance(message, ResultMessage):
-            log_entry["content"] = _to_jsonable(message)
+        # Handle different event types
+        if isinstance(event, dict):
+            # User message or simple dict
+            log_entry["content"] = _to_jsonable(event)
+        elif hasattr(event, "to_dict"):
+            # Openhands Event object
+            log_entry["content"] = _to_jsonable(event.to_dict())
+        else:
+            # Fallback: serialize as is
+            log_entry["content"] = _to_jsonable(event)
 
         with open(log_file, "a") as f:
             f.write(json.dumps(log_entry) + "\n")
 
-    def print_message_human_readable(self, message):
-        """Print Claude messages in human-readable format to stdout"""
-        if isinstance(message, UserMessage):
-            print(f"[User] {message.content}")
-        elif isinstance(message, AssistantMessage):
-            print("[Assistant]")
-            for block in message.content:
-                if isinstance(block, TextBlock):
-                    print(block.text)
-                elif isinstance(block, ToolUseBlock):
-                    print(
-                        f"[Tool Use] {getattr(block, 'name', '')}: {getattr(block, 'input', {})}"
-                    )
-                elif isinstance(block, ToolResultBlock):
-                    print(
-                        f"[Tool Result] {getattr(block, 'tool_use_id', '')}: {getattr(block, 'content', '')[:10]}..."
-                    )
-                elif isinstance(block, ThinkingBlock):
-                    print(f"[Thinking] {getattr(block, 'thinking', '')}")
-                else:
-                    # Print other block types as their string representation
-                    print(str(block))
-        elif isinstance(message, ResultMessage):
-            print("[Result]")
-            # Print available attributes of ResultMessage
-            for key, value in vars(message).items():
-                if value is not None:
-                    print(f"{key.capitalize()}: {value}")
+    def print_event_human_readable(self, event):
+        """Print Openhands events in human-readable format to stdout"""
+        if isinstance(event, dict):
+            # User message
+            print(f"[User] {event.get('content', event)}")
+        elif hasattr(event, "to_dict"):
+            # Openhands Event object
+            event_dict = event.to_dict()
+            event_type = event_dict.get("event_type", type(event).__name__)
+            source = event_dict.get("source", "unknown")
+
+            # Format based on event type
+            if "action" in event_type.lower():
+                action_name = event_dict.get("action", event_type)
+                print(f"[{source.upper()} Action] {action_name}")
+
+                # Print action details if available
+                if "args" in event_dict:
+                    print(f"  Args: {json.dumps(event_dict['args'], indent=2)[:200]}")
+                if "thought" in event_dict:
+                    print(f"  Thought: {event_dict['thought'][:200]}")
+
+            elif "observation" in event_type.lower():
+                obs_name = event_dict.get("observation", event_type)
+                print(f"[{source.upper()} Observation] {obs_name}")
+
+                # Print observation content if available
+                if "content" in event_dict:
+                    content = str(event_dict["content"])[:200]
+                    print(f"  Content: {content}")
+                if "output" in event_dict:
+                    output = str(event_dict["output"])[:200]
+                    print(f"  Output: {output}")
+            else:
+                # Generic event
+                print(f"[{source.upper()} {event_type}]")
+                print(f"  {json.dumps(event_dict, indent=2)[:200]}")
+        else:
+            # Fallback: print string representation
+            print(f"[Event] {str(event)[:200]}")
 
     async def execute(self):
         """Main execution flow"""
