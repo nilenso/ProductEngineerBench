@@ -200,7 +200,8 @@ class BenchmarkRunner:
             ):
                 has_error = True
 
-        # Create conversation with callback
+        # Create conversation in async context (allows MCP initialization to complete)
+        # This must happen BEFORE run_in_executor to avoid MCP timeout
         conversation = Conversation(
             agent=agent,
             workspace=str(cwd),
@@ -210,10 +211,10 @@ class BenchmarkRunner:
         # Log user message
         await self.log_message("implement", {"type": "user", "content": user_message})
 
-        # Send message and run conversation
+        # Send message
         conversation.send_message(user_message)
 
-        # Run in executor since conversation.run() is synchronous
+        # Only run() executes in thread pool executor
         await loop.run_in_executor(None, conversation.run)
 
         # Check for errors
@@ -273,7 +274,8 @@ class BenchmarkRunner:
             ):
                 has_error = True
 
-        # Create conversation with callback
+        # Create conversation in async context (allows MCP initialization to complete)
+        # This must happen BEFORE run_in_executor to avoid MCP timeout
         conversation = Conversation(
             agent=agent,
             workspace=str(cwd),
@@ -283,10 +285,10 @@ class BenchmarkRunner:
         # Log user message
         await self.log_message("evaluate", {"type": "user", "content": user_message})
 
-        # Send message and run conversation
+        # Send message
         conversation.send_message(user_message)
 
-        # Run in executor since conversation.run() is synchronous
+        # Only run() executes in thread pool executor
         await loop.run_in_executor(None, conversation.run)
 
         # Check for errors
