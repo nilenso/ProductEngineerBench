@@ -5,10 +5,9 @@ import subprocess
 from pathlib import Path
 
 import yaml
-from pydantic import SecretStr
-
 from openhands.sdk import LLM, Conversation
 from openhands.tools.preset.default import get_default_agent
+from pydantic import SecretStr
 
 
 class CodeImplementationError(Exception):
@@ -148,9 +147,7 @@ class BenchmarkRunner:
 
         subprocess.run(cmd, check=True)
 
-    async def implement_story(
-        self, cwd: Path, story: str, story_name: str
-    ) -> None:
+    async def implement_story(self, cwd: Path, story: str, story_name: str) -> None:
         self.current_story_name = story_name
 
         # Configure LLM
@@ -165,6 +162,8 @@ class BenchmarkRunner:
             api_key=SecretStr(api_key),
             base_url=base_url,
             usage_id="implementer",
+            max_input_tokens=os.getenv("MAX_INPUT_TOKENS", 100000),
+            max_output_tokens=os.getenv("MAX_OUTPUT_TOKENS", 20000),
         )
 
         # Create agent with default tools
@@ -178,18 +177,27 @@ class BenchmarkRunner:
         events_log = []
         has_error = False
 
+        # Get event loop for scheduling coroutines from thread
+        loop = asyncio.get_event_loop()
+
         def event_callback(event):
             """Callback to capture events during conversation"""
             nonlocal has_error
             events_log.append(event)
 
             # Log and print event
-            asyncio.create_task(self.log_message("implement", event))
+            # Use run_coroutine_threadsafe since callback runs in executor thread
+            asyncio.run_coroutine_threadsafe(
+                self.log_message("implement", event), loop
+            )
             self.print_event_human_readable(event)
 
             # Check for errors or failures
-            event_dict = event.to_dict() if hasattr(event, 'to_dict') else {}
-            if event_dict.get('source') == 'agent' and 'error' in str(event_dict).lower():
+            event_dict = event.to_dict() if hasattr(event, "to_dict") else {}
+            if (
+                event_dict.get("source") == "agent"
+                and "error" in str(event_dict).lower()
+            ):
                 has_error = True
 
         # Create conversation with callback
@@ -206,7 +214,6 @@ class BenchmarkRunner:
         conversation.send_message(user_message)
 
         # Run in executor since conversation.run() is synchronous
-        loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, conversation.run)
 
         # Check for errors
@@ -243,18 +250,27 @@ class BenchmarkRunner:
         events_log = []
         has_error = False
 
+        # Get event loop for scheduling coroutines from thread
+        loop = asyncio.get_event_loop()
+
         def event_callback(event):
             """Callback to capture events during conversation"""
             nonlocal has_error
             events_log.append(event)
 
             # Log and print event
-            asyncio.create_task(self.log_message("evaluate", event))
+            # Use run_coroutine_threadsafe since callback runs in executor thread
+            asyncio.run_coroutine_threadsafe(
+                self.log_message("evaluate", event), loop
+            )
             self.print_event_human_readable(event)
 
             # Check for errors or failures
-            event_dict = event.to_dict() if hasattr(event, 'to_dict') else {}
-            if event_dict.get('source') == 'agent' and 'error' in str(event_dict).lower():
+            event_dict = event.to_dict() if hasattr(event, "to_dict") else {}
+            if (
+                event_dict.get("source") == "agent"
+                and "error" in str(event_dict).lower()
+            ):
                 has_error = True
 
         # Create conversation with callback
@@ -271,7 +287,6 @@ class BenchmarkRunner:
         conversation.send_message(user_message)
 
         # Run in executor since conversation.run() is synchronous
-        loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, conversation.run)
 
         # Check for errors
