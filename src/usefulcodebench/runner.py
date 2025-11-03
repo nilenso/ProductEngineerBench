@@ -151,11 +151,11 @@ class BenchmarkRunner:
         self.current_story_name = story_name
 
         # Configure LLM
-        api_key = os.environ.get("LLM_API_KEY")
+        api_key = os.environ.get("IMPLEMENTER_LLM_API_KEY")
         if not api_key:
-            raise ValueError("LLM_API_KEY environment variable not set")
+            raise ValueError("IMPLEMENTER_LLM_API_KEY environment variable not set")
 
-        base_url = os.environ.get("LLM_BASE_URL")
+        base_url = os.environ.get("IMPLEMENTER_LLM_BASE_URL")
 
         llm = LLM(
             model=self.implementer_model,
@@ -187,9 +187,7 @@ class BenchmarkRunner:
 
             # Log and print event
             # Use run_coroutine_threadsafe since callback runs in executor thread
-            asyncio.run_coroutine_threadsafe(
-                self.log_message("implement", event), loop
-            )
+            asyncio.run_coroutine_threadsafe(self.log_message("implement", event), loop)
             self.print_event_human_readable(event)
 
             # Check for errors or failures
@@ -227,11 +225,11 @@ class BenchmarkRunner:
         self.current_story_name = story_name
 
         # Configure LLM
-        api_key = os.environ.get("LLM_API_KEY")
+        api_key = os.environ.get("EVALUATOR_LLM_API_KEY")
         if not api_key:
-            raise ValueError("LLM_API_KEY environment variable not set")
+            raise ValueError("EVALUATOR_LLM_API_KEY environment variable not set")
 
-        base_url = os.environ.get("LLM_BASE_URL")
+        base_url = os.environ.get("EVALUATOR_LLM_BASE_URL")
 
         llm = LLM(
             model=self.evaluator_model,
@@ -261,9 +259,7 @@ class BenchmarkRunner:
 
             # Log and print event
             # Use run_coroutine_threadsafe since callback runs in executor thread
-            asyncio.run_coroutine_threadsafe(
-                self.log_message("evaluate", event), loop
-            )
+            asyncio.run_coroutine_threadsafe(self.log_message("evaluate", event), loop)
             self.print_event_human_readable(event)
 
             # Check for errors or failures
