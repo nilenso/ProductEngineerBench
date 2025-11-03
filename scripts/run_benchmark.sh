@@ -36,9 +36,15 @@ fi
 for repo_data in "${repo_files[@]}"; do
     repo_rel="${repo_data#"${DATA_DIR}/"}"
     repo_name="${repo_rel%.yaml}"
-    timestamp=$(date +%Y%m%d_%H%M%S)
-    run_dir="${RESULTS_ROOT}/${repo_name}_${timestamp}"
-    mkdir -p "${run_dir}"
+
+    if [[ -n "${RUN_DIR:-}" ]]; then
+        run_dir="${RUN_DIR}"
+        mkdir -p "${run_dir}"
+    else
+        timestamp=$(date +%Y%m%d_%H%M%S)
+        run_dir="${RESULTS_ROOT}/${repo_name}_${timestamp}"
+        mkdir -p "${run_dir}"
+    fi
 
     echo "\n=== Running benchmark for ${repo_name} (results -> ${run_dir}) ==="
 
@@ -50,10 +56,19 @@ for repo_data in "${repo_files[@]}"; do
         "-e" "REPO_CONFIG=/data/${repo_rel}"
         "-e" "STORYMACHINE_CONFIG=/config/storymachine.yaml"
         "-e" "RESULTS_DIR=/results"
+        "-e" "RUN_DIR=/results"
     )
 
     if [[ -n "${GIT_TOKEN:-}" ]]; then
         docker_args+=("-e" "GIT_TOKEN=${GIT_TOKEN}")
+    fi
+
+    if [[ -n "${RESUME:-}" ]]; then
+        docker_args+=("-e" "RESUME=${RESUME}")
+    fi
+
+    if [[ -n "${FORCE_RESUME:-}" ]]; then
+        docker_args+=("-e" "FORCE_RESUME=${FORCE_RESUME}")
     fi
 
     if [[ -f "${ENV_FILE}" ]]; then

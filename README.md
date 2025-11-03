@@ -14,12 +14,15 @@ UsefulCodeBench is a benchmark harness that executes StoryMachine-driven coding 
 ## Prerequisites
 
 1. **Docker**: The benchmark executes inside a container. Install Docker Engine 24.x or newer.
-2. **LLM Provider credentials**: Set `LLM_API_KEY` in your `.env` file. Optionally set `LLM_BASE_URL` to use providers like OpenRouter, OpenAI, or other LiteLLM-compatible services.
+2. **LLM Provider credentials**: Set `IMPLEMENTER_LLM_API_KEY` and `EVALUATOR_LLM_API_KEY` in your `.env` file. Optionally set `IMPLEMENTER_LLM_BASE_URL` / `EVALUATOR_LLM_BASE_URL` to use providers like OpenRouter, OpenAI, or other LiteLLM-compatible services.
 3. **GitHub credentials**: Set `GIT_TOKEN` in your environment or `.env` file. The token must have `repo` scope for private GitHub repositories.
 4. **Required `.env` file**: Create a `.env` at the repository root with your LLM credentials and optional configuration:
    ```bash
-   LLM_API_KEY=your-api-key-here
-   LLM_BASE_URL=https://openrouter.ai/api/v1
+   IMPLEMENTER_LLM_API_KEY=your-implementer-key
+   EVALUATOR_LLM_API_KEY=your-evaluator-key
+   # Use the same credential for both roles if your provider does not differentiate.
+   IMPLEMENTER_LLM_BASE_URL=https://openrouter.ai/api/v1
+   EVALUATOR_LLM_BASE_URL=https://openrouter.ai/api/v1
    IMPLEMENTER_MODEL=anthropic/claude-3-5-haiku-20241022
    EVALUATOR_MODEL=anthropic/claude-3-5-sonnet-20241022
    ```
@@ -65,15 +68,18 @@ To run a single repository configuration, point `DATA_DIR` at a directory contai
 
 ### Required environment configuration
 
-Ensure your `.env` file contains `LLM_API_KEY`. The script does **not** verify credentials before running, but the benchmark will fail without them:
+Ensure your `.env` file contains both `IMPLEMENTER_LLM_API_KEY` and `EVALUATOR_LLM_API_KEY`. The script does **not** verify credentials before running, but the benchmark will fail without them:
 
 ```bash
 # .env file example
-LLM_API_KEY=your-api-key-here
+IMPLEMENTER_LLM_API_KEY=your-implementer-key
+EVALUATOR_LLM_API_KEY=your-evaluator-key
+# Use the same credential for both roles if your provider does not differentiate.
 GIT_TOKEN=ghp_your_token_here
 
 # Optional: Use OpenRouter or other providers
-LLM_BASE_URL=https://openrouter.ai/api/v1
+IMPLEMENTER_LLM_BASE_URL=https://openrouter.ai/api/v1
+EVALUATOR_LLM_BASE_URL=https://openrouter.ai/api/v1
 
 # Optional: Override default models
 IMPLEMENTER_MODEL=anthropic/claude-3-5-haiku-20241022
@@ -141,8 +147,8 @@ Ensure you have the same system dependencies installed as the Docker image (git,
 
 ## Troubleshooting
 
-- **Missing LLM credentials**: Ensure `LLM_API_KEY` is set in your `.env` file. The benchmark will fail immediately if credentials are missing.
-- **Provider-specific errors**: If using OpenRouter or non-Anthropic providers, verify `LLM_BASE_URL` is correct and model names match your provider's format.
+- **Missing LLM credentials**: Ensure `IMPLEMENTER_LLM_API_KEY` and `EVALUATOR_LLM_API_KEY` are set in your `.env` file. The benchmark will fail immediately if either credential is missing.
+- **Provider-specific errors**: If using OpenRouter or non-Anthropic providers, verify `IMPLEMENTER_LLM_BASE_URL` / `EVALUATOR_LLM_BASE_URL` are correct and model names match your provider's format.
 - **Git credential issues**: Confirm `GIT_TOKEN` is set in `.env` or exported; private repositories require this token.
 - **StoryMachine failures**: Validate `config/storymachine.yaml` and ensure the packaged version referenced in the config exists.
 - **Setup command failures**: The runner halts on the first non-zero exit. Re-run the benchmark after addressing the underlying issue inside the target repository.
