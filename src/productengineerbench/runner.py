@@ -157,7 +157,8 @@ class BenchmarkRunner:
 
     def setup_git_user(self) -> None:
         subprocess.run(
-            ["git", "config", "--global", "user.name", "UsefulCodeBench"], check=True
+            ["git", "config", "--global", "user.name", "ProductEngineerBench"],
+            check=True,
         )
         subprocess.run(
             ["git", "config", "--global", "user.email", "benchrunner@example.com"],

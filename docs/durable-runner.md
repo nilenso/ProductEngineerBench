@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document specifies durability for the UsefulCodeBench runner so that runs persist state as they progress and can be resumed after crashes or interruptions without redoing completed work.
+This document specifies durability for the ProductEngineerBench runner so that runs persist state as they progress and can be resumed after crashes or interruptions without redoing completed work.
 
 Primary goals:
 
@@ -286,14 +286,14 @@ No changes required. The runner writes to `/results` which is already mounted; r
 
 ### 1) Persist repo/stories under results
 
-- In `src/usefulcodebench/runner.py` set:
+- In `src/productengineerbench/runner.py` set:
   - `self.results_dir` from `RESULTS_DIR`.
   - `self.repo_dir = self.results_dir / "repo"`.
   - `self.stories_dir = self.results_dir / "stories"`.
 
 ### 2) RunState helper
 
-- New module `src/usefulcodebench/state.py` exporting `RunState` with responsibilities:
+- New module `src/productengineerbench/state.py` exporting `RunState` with responsibilities:
   - Read/write `manifest.json` and `stories_index.json` using atomic writes.
   - Manage per-story `status.json` transitions and timestamps.
   - Allocate `session_id` and `seq` counters for logging.
@@ -345,4 +345,3 @@ No changes required. The runner writes to `/results` which is already mounted; r
 - Checkpointing agent/tool state beyond JSONL transcripts.
 - Optional SQLite index over JSONL for faster analytics.
 - Content-addressable cache of evaluations by repo SHA + story hash.
-

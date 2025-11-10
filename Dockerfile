@@ -41,4 +41,4 @@ RUN chown -R bencher:bencher /home/bencher && chmod -R 755 /home/bencher
 USER bencher
 
 # Entrypoint expects REPO_CONFIG env var
-ENTRYPOINT ["uv", "run" ,"usefulcodebench"]
+ENTRYPOINT ["uv", "run" ,"productengineerbench"]

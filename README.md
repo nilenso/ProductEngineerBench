@@ -1,6 +1,6 @@
-# UsefulCodeBench
+# ProductEngineerBench
 
-UsefulCodeBench is a benchmark harness that executes StoryMachine-driven coding tasks end-to-end. It clones target repositories, generates implementation stories, applies LLM-based automation to implement/evaluate each story, and stores the resulting artifacts for later analysis.
+ProductEngineerBench is a benchmark harness that executes StoryMachine-driven coding tasks end-to-end. It clones target repositories, generates implementation stories, applies LLM-based automation to implement/evaluate each story, and stores the resulting artifacts for later analysis.
 
 ## Repository layout
 
@@ -8,7 +8,7 @@ UsefulCodeBench is a benchmark harness that executes StoryMachine-driven coding 
 - `config/storymachine.yaml` – StoryMachine configuration shared across runs.
 - `data/` – per-repository benchmark definitions and auxiliary assets.
 - `scripts/run_benchmark.sh` – convenience wrapper around the Docker invocation.
-- `src/usefulcodebench/` – Python package with the benchmark runner implementation.
+- `src/productengineerbench/` – Python package with the benchmark runner implementation.
 - `uv.lock`, `pyproject.toml` – Python dependency management.
 
 ## Prerequisites
@@ -140,7 +140,7 @@ If you prefer to run the Python entrypoint directly (outside Docker), install de
 
 ```/dev/null/README_dev.sh#L1-3
 uv sync
-uv run usefulcodebench
+uv run productengineerbench
 ```
 
 Ensure you have the same system dependencies installed as the Docker image (git, curl, sqlite3, Playwright prerequisites, etc.).
