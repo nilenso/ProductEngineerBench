@@ -1,10 +1,13 @@
 import asyncio
+import atexit
 import os
+import signal
 import subprocess
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
+from urllib.parse import quote
 
 import yaml
 from openhands.sdk import LLM, Conversation
@@ -46,7 +49,19 @@ class BenchmarkRunner:
         self.repo_config_path = repo_config_path
         self.storymachine_config_path = storymachine_config_path
 
-        self.resume = os.environ.get("RESUME", "0") == "1"
+        self.sync_bucket = os.environ.get("SYNC_BUCKET")
+        self.sync_prefix = os.environ.get("SYNC_PREFIX")
+        self.resume_prefix = os.environ.get("RESUME_PREFIX")
+
+        if self.sync_bucket and not self.sync_prefix:
+            raise ValueError("SYNC_PREFIX must be set when SYNC_BUCKET is provided")
+        if self.sync_prefix and not self.sync_bucket:
+            raise ValueError("SYNC_BUCKET must be set when SYNC_PREFIX is provided")
+        if self.resume_prefix and not self.sync_bucket:
+            raise ValueError("RESUME_PREFIX requires SYNC_BUCKET to be set")
+
+        resume_env = os.environ.get("RESUME", "0") == "1"
+        self.resume = resume_env or bool(self.resume_prefix)
         self.force_resume = os.environ.get("FORCE_RESUME", "0") == "1"
         self.skip_generate_stories = os.environ.get("SKIP_GENERATE_STORIES", "0") == "1"
         self.skip_implement = os.environ.get("SKIP_IMPLEMENT", "0") == "1"
@@ -56,8 +71,20 @@ class BenchmarkRunner:
             os.environ.get("EVALUATE_IF_RESULT_PRESENT", "0") == "1"
         )
 
+        if self.resume and os.environ.get("RESUME") != "1":
+            os.environ["RESUME"] = "1"
+
         self.results_root = Path(os.environ.get("RESULTS_DIR", "/results")).expanduser()
         self.run_root = self._resolve_run_root()
+        self.run_id = os.environ.get("RUN_ID") or self.run_root.name
+
+        self.sync_enabled = bool(self.sync_bucket and self.sync_prefix)
+        self._sync_completed = False
+        self._final_status = "running"
+        self._sigterm_handler_registered = False
+
+        if self.resume_prefix:
+            self._download_resume_state()
 
         self.state = RunState(
             self.run_root,
@@ -77,6 +104,9 @@ class BenchmarkRunner:
         self.evaluator_model = os.environ.get("EVALUATOR_MODEL", "claude-sonnet-4-5")
 
         self._initialize_manifest()
+        self.state.update_manifest_status("running")
+        atexit.register(self._atexit_sync)
+        self._register_sigterm_handler()
 
     def _resolve_run_root(self) -> Path:
         run_dir_env = os.environ.get("RUN_DIR")
@@ -146,7 +176,7 @@ class BenchmarkRunner:
             self.state.validate_resume_compatibility()
 
         self.state.initialize_manifest(
-            run_id=self.run_root.name,
+            run_id=self.run_id,
             image=image_name,
             tools=tools_meta,
             models=models_meta,
@@ -154,6 +184,54 @@ class BenchmarkRunner:
         )
         self.state.update_manifest_models(models_meta)
         self.state.update_manifest_repo(repo_meta)
+
+    def _register_sigterm_handler(self) -> None:
+        if self._sigterm_handler_registered:
+            return
+        try:
+            signal.signal(signal.SIGTERM, self._handle_sigterm)
+            self._sigterm_handler_registered = True
+        except ValueError:
+            self._sigterm_handler_registered = False
+
+    def _handle_sigterm(self, signum: int, frame: Optional[Any]) -> None:
+        self.mark_cancelled()
+        raise SystemExit(130)
+
+    def _s3_uri(self, prefix: str) -> str:
+        if not self.sync_bucket:
+            raise ValueError("SYNC_BUCKET must be set for S3 sync")
+        clean = prefix.lstrip("/")
+        return f"s3://{self.sync_bucket}/{clean}"
+
+    def _aws_sync(self, source: str, dest: str, *, delete: bool = False) -> None:
+        cmd = ["aws", "s3", "sync", source, dest, "--only-show-errors"]
+        if delete:
+            cmd.append("--delete")
+        subprocess.run(cmd, check=True)
+
+    def _download_resume_state(self) -> None:
+        if not self.resume_prefix:
+            return
+        source = self._s3_uri(self.resume_prefix)
+        print(f"Syncing resume data from {source} -> {self.run_root}")
+        self._aws_sync(source, str(self.run_root), delete=False)
+
+    def _sync_results_to_s3(self) -> None:
+        if not self.sync_enabled:
+            return
+        dest = self._s3_uri(self.sync_prefix or "")
+        print(f"Uploading run directory to {dest}")
+        self._aws_sync(str(self.run_root), dest, delete=True)
+        self._sync_completed = True
+
+    def _atexit_sync(self) -> None:
+        if not self.sync_enabled or self._sync_completed:
+            return
+        try:
+            self._sync_results_to_s3()
+        except Exception as exc:
+            print(f"Warning: failed to sync run directory during shutdown: {exc}")
 
     def setup_git_user(self) -> None:
         subprocess.run(
@@ -169,13 +247,19 @@ class BenchmarkRunner:
         git_token = os.environ.get("GIT_TOKEN")
         if not git_token:
             raise ValueError("GIT_TOKEN environment variable not set")
+        git_username = os.environ.get("GIT_USERNAME", "x-access-token")
 
         subprocess.run(
             ["git", "config", "--global", "credential.helper", "store"], check=True
         )
 
+        # Git expects the personal access token in the password slot.
+        encoded_token = quote(git_token, safe="")
+        encoded_username = quote(git_username, safe="")
         credentials_file = Path.home() / ".git-credentials"
-        credentials_file.write_text(f"https://{git_token}:@github.com\n")
+        credentials_file.write_text(
+            f"https://{encoded_username}:{encoded_token}@github.com\n"
+        )
         credentials_file.chmod(0o600)
 
     def _git(
@@ -627,6 +711,32 @@ class BenchmarkRunner:
         print("Running benchmark...")
         await self.run_benchmark()
 
+    def finalize(self) -> None:
+        if self.sync_enabled and not self._sync_completed:
+            self._sync_results_to_s3()
+
+    def mark_success(self) -> None:
+        if self._final_status != "running":
+            return
+        self._final_status = "success"
+        self.state.update_manifest_status("success")
+
+    def mark_failure(self) -> None:
+        if self._final_status == "cancelled":
+            return
+        self._final_status = "failure"
+        self.state.update_manifest_status("failure")
+
+    def mark_cancelled(self) -> None:
+        if self._final_status == "cancelled":
+            return
+        self._final_status = "cancelled"
+        self.state.update_manifest_status("cancelled")
+
+    @property
+    def final_status(self) -> str:
+        return self._final_status
+
 
 def run() -> None:
     repo_config_path = Path(os.environ.get("REPO_CONFIG", "/data/repo.yaml"))
@@ -643,4 +753,19 @@ def run() -> None:
         repo_config_path=repo_config_path,
         storymachine_config_path=storymachine_config_path,
     )
-    asyncio.run(runner.execute())
+    try:
+        asyncio.run(runner.execute())
+    except KeyboardInterrupt:
+        runner.mark_cancelled()
+        raise
+    except SystemExit:
+        if runner.final_status != "cancelled":
+            runner.mark_failure()
+        raise
+    except Exception:
+        runner.mark_failure()
+        raise
+    else:
+        runner.mark_success()
+    finally:
+        runner.finalize()

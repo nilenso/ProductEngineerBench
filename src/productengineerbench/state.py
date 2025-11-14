@@ -11,8 +11,11 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 def _iso_now() -> str:
     """Return an ISO-8601 timestamp in UTC without microseconds."""
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace(
-        "+00:00", "Z"
+    return (
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
     )
 
 
@@ -149,10 +152,14 @@ class RunState:
         existing = self.load_manifest()
         if existing:
             return existing
+        now = _iso_now()
         manifest = {
             "schema_version": self.SCHEMA_VERSION,
             "run_id": run_id,
-            "created_at": _iso_now(),
+            "created_at": now,
+            "updated_at": now,
+            "completed_at": None,
+            "status": "pending",
             "image": image,
             "tools": tools,
             "models": models,
@@ -175,6 +182,20 @@ class RunState:
         if not manifest:
             return
         manifest["repo"] = repo_meta
+        _atomic_write_json(self.manifest_path, manifest)
+        self._manifest_cache = manifest
+
+    def update_manifest_status(self, status: str) -> None:
+        manifest = self.load_manifest()
+        if not manifest:
+            return
+        timestamp = _iso_now()
+        manifest["status"] = status
+        manifest["updated_at"] = timestamp
+        if status in {"success", "failure", "cancelled"}:
+            manifest["completed_at"] = timestamp
+        else:
+            manifest["completed_at"] = None
         _atomic_write_json(self.manifest_path, manifest)
         self._manifest_cache = manifest
 
@@ -203,9 +224,11 @@ class RunState:
         sm_cfg = self._storymachine_config
         if sm_manifest:
             if (
-                sm_manifest.get("package") and sm_manifest.get("package") != sm_cfg.get("package")
+                sm_manifest.get("package")
+                and sm_manifest.get("package") != sm_cfg.get("package")
             ) or (
-                sm_manifest.get("version") and sm_manifest.get("version") != sm_cfg.get("version")
+                sm_manifest.get("version")
+                and sm_manifest.get("version") != sm_cfg.get("version")
             ):
                 errors.append(
                     "Storymachine package/version mismatch between manifest and config"

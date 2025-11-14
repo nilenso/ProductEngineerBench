@@ -52,7 +52,16 @@ The script performs the following for each YAML file in `data/`:
 2. Launches `docker run` with the appropriate mounts and environment variables.
 3. Forwards credentials (`GIT_TOKEN`) and LLM configuration from `.env`.
 
-### Environment overrides
+### Targeted runs & environment overrides
+
+`scripts/run_benchmark.sh` accepts a few flags that make iterative and remote workflows simpler:
+
+- `--repo grand_central` (or `--config /abs/path/to/file.yaml`) runs exactly one configuration.
+- `--run-dir /abs/path` forces a deterministic host directory (single repo only) and `--print-run-dir` emits `RUN_DIR=<path>`, which is handy for wrappers that need to sync artifacts.
+- `--docker-context do-bench` forwards the Docker context to every `docker run`, enabling remote execution via `docker context`.
+- `--container-name peb-runner` sets `docker --name` so you can stop the container via `docker stop peb-runner`.
+
+For advanced use cases you can mix those flags with the environment variables below:
 
 The script honors the following variables for advanced usage:
 
@@ -144,6 +153,18 @@ uv run productengineerbench
 ```
 
 Ensure you have the same system dependencies installed as the Docker image (git, curl, sqlite3, Playwright prerequisites, etc.).
+
+## Remote execution
+
+DigitalOcean hosts a persistent runner VM for longer ProductEngineerBench runs. The repository contains helper scripts that wrap the workflow end-to-end:
+
+- `scripts/setup_docker_context.sh` – creates an SSH-backed Docker context (defaults to `do-bench`).
+- `scripts/run_remote_benchmark.sh` – bootstraps `~/ProductEngineerBench` (or a custom path) on the droplet, checks out the requested git ref, picks deterministic run directories, injects S3/remote env vars, and launches `run_benchmark.sh` using your Docker context.
+- `scripts/fetch_results.sh` – downloads run artifacts back to your laptop via `aws s3 sync`.
+
+See `docs/remote-launch.md` for full instructions, env var descriptions, and the durability/resume expectations.
+
+Tip: pass `--bench-ref <branch|tag|sha>` (or set `BENCH_REMOTE_REF`) to force a specific ProductEngineerBench revision, and `--repo-url` if you need to point at a fork; the helper clones the repo on the droplet automatically if it is missing.
 
 ## Troubleshooting
 
