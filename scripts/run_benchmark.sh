@@ -97,6 +97,9 @@ if (( remote_mode )); then
     manage_local_paths=0
 fi
 
+aws_credentials_dir=${BENCH_AWS_DIR:-${HOME}/.aws}
+container_aws_dir=${BENCH_CONTAINER_AWS_DIR:-/home/bencher/.aws}
+
 if (( manage_local_paths )); then
     if [[ ! -d "${DATA_DIR}" ]]; then
         echo "Expected data directory at ${DATA_DIR}" >&2
@@ -236,8 +239,23 @@ for repo_data in "${repo_files[@]}"; do
         docker_args+=("--env-file" "${env_file}")
     fi
 
-    if [[ -d "${HOME}/.aws" ]]; then
-        docker_args+=("-v" "${HOME}/.aws:/root/.aws:ro")
+    if (( remote_mode )); then
+        if [[ -n "${BENCH_AWS_DIR}" ]]; then
+            docker_args+=("-v" "${aws_credentials_dir}:${container_aws_dir}:ro")
+        else
+            echo "Warning: remote run without BENCH_AWS_DIR; AWS credentials will not be mounted." >&2
+        fi
+    else
+        if [[ -d "${aws_credentials_dir}" ]]; then
+            docker_args+=("-v" "${aws_credentials_dir}:${container_aws_dir}:ro")
+        fi
+    fi
+
+    if [[ -z "${AWS_SHARED_CREDENTIALS_FILE:-}" ]]; then
+        docker_args+=("-e" "AWS_SHARED_CREDENTIALS_FILE=${container_aws_dir}/credentials")
+    fi
+    if [[ -z "${AWS_CONFIG_FILE:-}" ]]; then
+        docker_args+=("-e" "AWS_CONFIG_FILE=${container_aws_dir}/config")
     fi
 
     set +e

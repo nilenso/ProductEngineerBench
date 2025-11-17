@@ -24,6 +24,7 @@ Options:
   --remote-results PATH   Directory for run artifacts on the droplet (default: /home/bench/results).
   --env-file PATH         Remote .env path (default: /home/bench/.env.remote).
   --container-name NAME   Name for docker --name (default: peb-runner).
+  --stop-timeout SECONDS  Time docker stop waits before SIGKILL (default: 600).
   --skip-refresh          Skip the git pull / uv sync step on the droplet.
   --cancel NAME           Stop an existing container via docker --context <NAME> stop.
   -h, --help              Show this message and exit.
@@ -57,6 +58,7 @@ skip_refresh=0
 container_name="peb-runner"
 cancel_target=""
 remote_home=""
+stop_timeout=${BENCH_REMOTE_STOP_TIMEOUT:-600}
 local_env_file=""
 if [[ -f "${REPO_ROOT}/.env.remote" ]]; then
     local_env_file="${REPO_ROOT}/.env.remote"
@@ -141,6 +143,15 @@ while [[ $# -gt 0 ]]; do
             container_name="$2"
             shift 2
             ;;
+        --stop-timeout)
+            [[ $# -ge 2 ]] || { echo "--stop-timeout requires an argument" >&2; exit 1; }
+            if ! [[ "$2" =~ ^[0-9]+$ ]]; then
+                echo "--stop-timeout expects an integer number of seconds" >&2
+                exit 1
+            fi
+            stop_timeout="$2"
+            shift 2
+            ;;
         --skip-refresh)
             skip_refresh=1
             shift
@@ -169,8 +180,9 @@ done
 docker_cmd=(docker --context "${context_name}")
 
 if [[ -n "${cancel_target}" ]]; then
-    echo "Stopping container ${cancel_target} via docker --context ${context_name} stop..."
-    "${docker_cmd[@]}" stop "${cancel_target}"
+    echo "Stopping container ${cancel_target} via docker --context ${context_name} stop --time ${stop_timeout}..."
+    echo "Waiting up to ${stop_timeout}s so the runner can upload its results to S3."
+    "${docker_cmd[@]}" stop --time "${stop_timeout}" "${cancel_target}"
     exit 0
 fi
 
@@ -220,6 +232,10 @@ fi
 
 if [[ -n "${remote_env_file}" && "${remote_env_file}" != /* ]]; then
     remote_env_file="${REPO_ROOT}/${remote_env_file#./}"
+fi
+
+if [[ -z "${remote_home}" && -n "${ssh_target}" ]]; then
+    remote_home=$(ssh ${ssh_opts} "${ssh_target}" 'printf %s "$HOME"')
 fi
 
 if [[ -z "${remote_repo_url}" ]]; then
@@ -304,6 +320,10 @@ env_args=(
 
 if [[ -n "${resume_prefix}" ]]; then
     env_args+=("RESUME_PREFIX=${resume_prefix}" "RESUME=1")
+fi
+
+if [[ -n "${remote_home}" ]]; then
+    env_args+=("BENCH_AWS_DIR=${remote_home%/}/.aws")
 fi
 
 benchmark_args=(--docker-context "${context_name}" --print-run-dir --run-dir "${run_dir}" --container-name "${container_name}")

@@ -201,6 +201,7 @@ class BenchmarkRunner:
             self._sigterm_handler_registered = False
 
     def _handle_sigterm(self, signum: int, frame: Optional[Any]) -> None:
+        print("SIGTERM received; marking run cancelled and syncing results...")
         self.mark_cancelled()
         raise SystemExit(130)
 
