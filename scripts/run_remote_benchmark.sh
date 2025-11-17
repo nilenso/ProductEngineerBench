@@ -57,6 +57,12 @@ skip_refresh=0
 container_name="peb-runner"
 cancel_target=""
 remote_home=""
+local_env_file=""
+if [[ -f "${REPO_ROOT}/.env.remote" ]]; then
+    local_env_file="${REPO_ROOT}/.env.remote"
+elif [[ -f "${REPO_ROOT}/.env" ]]; then
+    local_env_file="${REPO_ROOT}/.env"
+fi
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -198,15 +204,22 @@ if [[ -n "${ssh_host}" ]]; then
     ssh_target="${ssh_user}@${ssh_host}"
 fi
 
-if [[ -z "${remote_repo_root}" || -z "${remote_results_root}" || -z "${remote_env_file}" ]]; then
+if [[ -z "${remote_repo_root}" || -z "${remote_results_root}" ]]; then
     if [[ -z "${ssh_target}" ]]; then
-        echo "Provide --ssh-host (or set REMOTE_REPO_ROOT/REMOTE_RESULTS_ROOT/REMOTE_ENV_FILE) so remote paths can be resolved." >&2
+        echo "Provide --ssh-host (or set REMOTE_REPO_ROOT/REMOTE_RESULTS_ROOT) so remote paths can be resolved." >&2
         exit 1
     fi
     remote_home=$(ssh ${ssh_opts} "${ssh_target}" 'printf %s "$HOME"')
     remote_repo_root=${remote_repo_root:-${remote_home}/ProductEngineerBench}
     remote_results_root=${remote_results_root:-${remote_home}/results}
-    remote_env_file=${remote_env_file:-${remote_home}/.env.remote}
+fi
+
+if [[ -z "${remote_env_file}" && -n "${local_env_file}" ]]; then
+    remote_env_file="${local_env_file}"
+fi
+
+if [[ -n "${remote_env_file}" && "${remote_env_file}" != /* ]]; then
+    remote_env_file="${REPO_ROOT}/${remote_env_file#./}"
 fi
 
 if [[ -z "${remote_repo_url}" ]]; then

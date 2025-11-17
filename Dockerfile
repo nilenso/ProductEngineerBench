@@ -3,6 +3,7 @@ FROM python:3.11-slim
 # Install common tools
 RUN apt-get update && apt-get install -y \
     git curl sqlite3 build-essential procps \
+    awscli \
     # for browser automation
     xvfb libx11-6 libx11-xcb1 libxcb1 libxcomposite1 libxdamage1 libxfixes3 \
     libxrandr2 libxkbcommon0 libxext6 libxshmfence1 libxss1 libxtst6 \

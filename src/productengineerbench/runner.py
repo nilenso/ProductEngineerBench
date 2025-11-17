@@ -1,8 +1,11 @@
 import asyncio
 import atexit
 import os
+import shlex
+import shutil
 import signal
 import subprocess
+import time
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -82,7 +85,10 @@ class BenchmarkRunner:
         self._sync_completed = False
         self._final_status = "running"
         self._sigterm_handler_registered = False
+        self._aws_cli_path: Optional[str] = None
 
+        if self.sync_enabled or self.resume_prefix:
+            self._ensure_aws_cli()
         if self.resume_prefix:
             self._download_resume_state()
 
@@ -198,31 +204,59 @@ class BenchmarkRunner:
         self.mark_cancelled()
         raise SystemExit(130)
 
+    def _ensure_aws_cli(self) -> str:
+        if self._aws_cli_path:
+            return self._aws_cli_path
+        aws_path = shutil.which("aws")
+        if not aws_path:
+            raise RuntimeError(
+                "AWS CLI not found on PATH while SYNC/RESUME is enabled. "
+                "Install awscli in the runner image or unset SYNC_BUCKET/SYNC_PREFIX."
+            )
+        self._aws_cli_path = aws_path
+        print(f"[S3] Detected aws CLI at {aws_path}")
+        return aws_path
+
     def _s3_uri(self, prefix: str) -> str:
         if not self.sync_bucket:
             raise ValueError("SYNC_BUCKET must be set for S3 sync")
         clean = prefix.lstrip("/")
         return f"s3://{self.sync_bucket}/{clean}"
 
-    def _aws_sync(self, source: str, dest: str, *, delete: bool = False) -> None:
-        cmd = ["aws", "s3", "sync", source, dest, "--only-show-errors"]
+    def _aws_sync(
+        self, source: str, dest: str, *, delete: bool = False, label: str = "sync"
+    ) -> None:
+        aws_exe = self._ensure_aws_cli()
+        cmd = [aws_exe, "s3", "sync", source, dest, "--only-show-errors"]
         if delete:
             cmd.append("--delete")
-        subprocess.run(cmd, check=True)
+        printable = " ".join(shlex.quote(token) for token in cmd)
+        print(f"[S3:{label}] {printable}")
+        start = time.monotonic()
+        try:
+            subprocess.run(cmd, check=True)
+        except subprocess.CalledProcessError as exc:
+            elapsed = time.monotonic() - start
+            print(
+                f"[S3:{label}] aws exited with {exc.returncode} after {elapsed:.1f}s"
+            )
+            raise
+        elapsed = time.monotonic() - start
+        print(f"[S3:{label}] Completed in {elapsed:.1f}s")
 
     def _download_resume_state(self) -> None:
         if not self.resume_prefix:
             return
         source = self._s3_uri(self.resume_prefix)
         print(f"Syncing resume data from {source} -> {self.run_root}")
-        self._aws_sync(source, str(self.run_root), delete=False)
+        self._aws_sync(source, str(self.run_root), delete=False, label="resume")
 
     def _sync_results_to_s3(self) -> None:
         if not self.sync_enabled:
             return
         dest = self._s3_uri(self.sync_prefix or "")
-        print(f"Uploading run directory to {dest}")
-        self._aws_sync(str(self.run_root), dest, delete=True)
+        print(f"Uploading run directory {self.run_root} to {dest}")
+        self._aws_sync(str(self.run_root), dest, delete=True, label="upload")
         self._sync_completed = True
 
     def _atexit_sync(self) -> None:
