@@ -5,6 +5,7 @@ import shlex
 import shutil
 import signal
 import subprocess
+import tempfile
 import time
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
@@ -81,6 +82,7 @@ class BenchmarkRunner:
         self.run_root = self._resolve_run_root()
         self.run_id = os.environ.get("RUN_ID") or self.run_root.name
 
+        self._normalize_aws_env()
         self.sync_enabled = bool(self.sync_bucket and self.sync_prefix)
         self._sync_completed = False
         self._final_status = "running"
@@ -205,6 +207,37 @@ class BenchmarkRunner:
         self.mark_cancelled()
         raise SystemExit(130)
 
+    def _normalize_aws_env(self) -> None:
+        def _strip_quotes(value: str) -> str:
+            trimmed = value.strip()
+            if len(trimmed) >= 2 and (
+                (trimmed.startswith('"') and trimmed.endswith('"'))
+                or (trimmed.startswith("'") and trimmed.endswith("'"))
+            ):
+                return trimmed[1:-1].strip()
+            return value
+
+        for key in (
+            "AWS_PROFILE",
+            "AWS_SHARED_CREDENTIALS_FILE",
+            "AWS_CONFIG_FILE",
+        ):
+            value = os.environ.get(key)
+            if not value:
+                continue
+            cleaned = _strip_quotes(value)
+            if cleaned != value:
+                os.environ[key] = cleaned
+                print(f"[S3] Normalized {key} to {cleaned}")
+
+        creds_path = os.environ.get("AWS_SHARED_CREDENTIALS_FILE")
+        if creds_path and not Path(creds_path).exists():
+            print(f"[S3] Warning: AWS_SHARED_CREDENTIALS_FILE not found at {creds_path}")
+
+        config_path = os.environ.get("AWS_CONFIG_FILE")
+        if config_path and not Path(config_path).exists():
+            print(f"[S3] Warning: AWS_CONFIG_FILE not found at {config_path}")
+
     def _ensure_aws_cli(self) -> str:
         if self._aws_cli_path:
             return self._aws_cli_path
@@ -223,6 +256,13 @@ class BenchmarkRunner:
             raise ValueError("SYNC_BUCKET must be set for S3 sync")
         clean = prefix.lstrip("/")
         return f"s3://{self.sync_bucket}/{clean}"
+
+    def _tarball_key(self, prefix: str) -> str:
+        clean = prefix.rstrip("/")
+        return f"{clean}.tar.gz"
+
+    def _tarball_uri(self, prefix: str) -> str:
+        return self._s3_uri(self._tarball_key(prefix))
 
     def _aws_sync(
         self, source: str, dest: str, *, delete: bool = False, label: str = "sync"
@@ -245,12 +285,31 @@ class BenchmarkRunner:
         elapsed = time.monotonic() - start
         print(f"[S3:{label}] Completed in {elapsed:.1f}s")
 
+    def _aws_cp(self, local_path: str, remote_uri: str, *, upload: bool, label: str) -> None:
+        aws_exe = self._ensure_aws_cli()
+        if upload:
+            cmd = [aws_exe, "s3", "cp", local_path, remote_uri]
+        else:
+            cmd = [aws_exe, "s3", "cp", remote_uri, local_path]
+        printable = " ".join(shlex.quote(token) for token in cmd)
+        print(f"[S3:{label}] {printable}")
+        start = time.monotonic()
+        try:
+            subprocess.run(cmd, check=True)
+        except subprocess.CalledProcessError as exc:
+            elapsed = time.monotonic() - start
+            print(
+                f"[S3:{label}] aws exited with {exc.returncode} after {elapsed:.1f}s"
+            )
+            raise
+        elapsed = time.monotonic() - start
+        print(f"[S3:{label}] Completed in {elapsed:.1f}s")
+
     def _download_resume_state(self) -> None:
         if not self.resume_prefix:
             return
-        source = self._s3_uri(self.resume_prefix)
-        print(f"Syncing resume data from {source} -> {self.run_root}")
-        self._aws_sync(source, str(self.run_root), delete=False, label="resume")
+        archive_uri = self._tarball_uri(self.resume_prefix)
+        self._download_and_extract_archive(archive_uri)
 
     def _sync_results_to_s3(self) -> None:
         if not self.sync_enabled:
@@ -258,7 +317,57 @@ class BenchmarkRunner:
         dest = self._s3_uri(self.sync_prefix or "")
         print(f"Uploading run directory {self.run_root} to {dest}")
         self._aws_sync(str(self.run_root), dest, delete=True, label="upload")
+        archive_path = self._create_run_archive()
+        try:
+            archive_dest = self._tarball_uri(self.sync_prefix or "")
+            print(f"Uploading run archive {archive_path} to {archive_dest}")
+            self._aws_cp(str(archive_path), archive_dest, upload=True, label="upload-archive")
+        finally:
+            try:
+                archive_path.unlink()
+            except FileNotFoundError:
+                pass
         self._sync_completed = True
+
+    def _create_run_archive(self) -> Path:
+        fd, tmp_path = tempfile.mkstemp(prefix=f"{self.run_root.name}_", suffix=".tar.gz")
+        os.close(fd)
+        tar_path = Path(tmp_path)
+        subprocess.run(
+            ["tar", "-czf", str(tar_path), "-C", str(self.run_root), "."],
+            check=True,
+        )
+        return tar_path
+
+    def _download_and_extract_archive(self, archive_uri: str) -> None:
+        fd, tmp_path = tempfile.mkstemp(prefix="resume_", suffix=".tar.gz")
+        os.close(fd)
+        local_path = Path(tmp_path)
+        try:
+            print(f"Restoring run directory from {archive_uri}")
+            self._aws_cp(str(local_path), archive_uri, upload=False, label="resume-archive")
+        except subprocess.CalledProcessError as exc:
+            local_path.unlink(missing_ok=True)
+            raise RuntimeError(
+                f"Resume archive {archive_uri} not found or inaccessible; cannot resume without it."
+            ) from exc
+        self._wipe_run_root()
+        subprocess.run(
+            ["tar", "-xzf", str(local_path), "-C", str(self.run_root)],
+            check=True,
+        )
+        print("Resume restored from archive.")
+        local_path.unlink(missing_ok=True)
+
+    def _wipe_run_root(self) -> None:
+        if not self.run_root.exists():
+            self.run_root.mkdir(parents=True, exist_ok=True)
+            return
+        for child in self.run_root.iterdir():
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
 
     def _atexit_sync(self) -> None:
         if not self.sync_enabled or self._sync_completed:

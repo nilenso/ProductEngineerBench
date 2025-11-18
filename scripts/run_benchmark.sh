@@ -221,12 +221,18 @@ for repo_data in "${repo_files[@]}"; do
         "-e" "RUN_ID=$(basename "${run_dir}")"
     )
 
+    if (( remote_mode )); then
+        docker_args+=("--sig-proxy=false")
+    fi
+
+    current_container=""
     if [[ -n "${container_name}" ]]; then
         unique_name="${container_name}"
         if (( ${#repo_files[@]} > 1 )); then
             unique_name="${container_name}-${run_index}"
         fi
         docker_args+=("--name" "${unique_name}")
+        current_container="${unique_name}"
     fi
 
     for var in "${pass_env_vars[@]}"; do
@@ -262,6 +268,16 @@ for repo_data in "${repo_files[@]}"; do
     "${docker_cmd[@]}" run "${docker_args[@]}" "${IMAGE_NAME}"
     exit_code=$?
     set -e
+
+    if (( exit_code == 130 )) && (( remote_mode )); then
+        if [[ -n "${current_container}" ]]; then
+            echo "Detached from remote container ${current_container}; it continues running on ${docker_context}."
+        else
+            echo "Detached from remote run; container continues running on ${docker_context}."
+        fi
+        echo "Use scripts/run_remote_benchmark.sh --context ${docker_context} --cancel ${current_container:-<container>} to stop it explicitly."
+        continue
+    fi
 
     if (( exit_code != 0 )); then
         exit "${exit_code}"

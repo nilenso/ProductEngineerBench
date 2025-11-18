@@ -99,8 +99,8 @@ Inside the container, the Python runner reacts to these env vars:
 
 | Env var | Behavior |
 | --- | --- |
-| `SYNC_BUCKET` + `SYNC_PREFIX` | Enable S3 durability. On shutdown the runner executes `aws s3 sync $RUN_DIR s3://$SYNC_BUCKET/$SYNC_PREFIX --delete`. |
-| `RESUME_PREFIX` | Before touching the repo, the runner executes `aws s3 sync s3://$SYNC_BUCKET/$RESUME_PREFIX $RUN_DIR` and enables resume mode. |
+| `SYNC_BUCKET` + `SYNC_PREFIX` | Enable S3 durability. On shutdown the runner executes `aws s3 sync $RUN_DIR s3://$SYNC_BUCKET/$SYNC_PREFIX --delete`. It also emits a tarball at `s3://$SYNC_BUCKET/$SYNC_PREFIX.tar.gz` that preserves POSIX metadata. |
+| `RESUME_PREFIX` | Before touching the repo, the runner downloads and extracts `s3://$SYNC_BUCKET/$RESUME_PREFIX.tar.gz`. The archive is required for resume; if it is missing the run aborts. |
 | `AWS_PROFILE` / `AWS_REGION` | Forwarded to `aws s3 sync`. The droplet mounts `/home/bench/.aws` into the container so credentials resolve automatically. |
 | `RUN_ID` | Included in `manifest.json` to match the S3 prefix/run directory names. |
 
