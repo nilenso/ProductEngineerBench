@@ -100,6 +100,10 @@ class RunState:
     def stories_index_path(self) -> Path:
         return self.run_root / "stories_index.json"
 
+    @property
+    def checkpoints_path(self) -> Path:
+        return self.run_root / "checkpoints.jsonl"
+
     def story_dir(self, story_file: str) -> Path:
         return self.stories_dir / Path(story_file).stem
 
@@ -168,6 +172,19 @@ class RunState:
         _atomic_write_json(self.manifest_path, manifest)
         self._manifest_cache = manifest
         return manifest
+
+    def flush(self) -> None:
+        """Flush cached manifest/story index to disk if present.
+
+        This keeps checkpoint syncing predictable if callers mutated caches
+        directly (unlikely today) but want to guarantee durability before
+        triggering a remote sync.
+        """
+        if self._manifest_cache is not None:
+            _atomic_write_json(self.manifest_path, self._manifest_cache)
+        if self._story_index_cache is not None:
+            payload = {"order": list(self._story_index_cache)}
+            _atomic_write_json(self.stories_index_path, payload)
 
     def update_manifest_models(self, models: Dict[str, Any]) -> None:
         manifest = self.load_manifest()
@@ -403,3 +420,23 @@ class RunState:
         path = self.story_dir(story_file) / "artifacts"
         path.mkdir(parents=True, exist_ok=True)
         return path
+
+    def record_checkpoint(self, reason: str, *, extra: Optional[Dict[str, Any]] = None) -> None:
+        """Append a checkpoint marker for auditing sync attempts.
+
+        The marker is intentionally lightweight; it should never throw
+        unless the filesystem itself is failing.
+        """
+        payload: Dict[str, Any] = {
+            "timestamp": _iso_now(),
+            "reason": reason,
+        }
+        if extra:
+            payload["extra"] = extra
+
+        self.checkpoints_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.checkpoints_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        _fsync_dir(self.checkpoints_path.parent)

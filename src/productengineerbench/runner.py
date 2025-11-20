@@ -1,5 +1,4 @@
 import asyncio
-import atexit
 import os
 import shlex
 import shutil
@@ -84,7 +83,6 @@ class BenchmarkRunner:
 
         self._normalize_aws_env()
         self.sync_enabled = bool(self.sync_bucket and self.sync_prefix)
-        self._sync_completed = False
         self._final_status = "running"
         self._sigterm_handler_registered = False
         self._aws_cli_path: Optional[str] = None
@@ -113,8 +111,8 @@ class BenchmarkRunner:
 
         self._initialize_manifest()
         self.state.update_manifest_status("running")
-        atexit.register(self._atexit_sync)
         self._register_sigterm_handler()
+        self._checkpoint_state("init")
 
     def _resolve_run_root(self) -> Path:
         run_dir_env = os.environ.get("RUN_DIR")
@@ -327,7 +325,20 @@ class BenchmarkRunner:
                 archive_path.unlink()
             except FileNotFoundError:
                 pass
-        self._sync_completed = True
+
+    def _checkpoint_state(self, reason: str) -> None:
+        if not self.sync_enabled:
+            return
+        try:
+            self.state.flush()
+            self.state.record_checkpoint(reason, extra={"run_id": self.run_id})
+        except Exception as exc:  # narrow downside: never block sync attempt
+            print(f"[Checkpoint] Failed to record checkpoint {reason}: {exc}")
+        try:
+            self._sync_results_to_s3()
+            print(f"[Checkpoint] Completed sync for {reason}")
+        except Exception as exc:
+            print(f"[Checkpoint] Sync failed for {reason}: {exc}")
 
     def _create_run_archive(self) -> Path:
         fd, tmp_path = tempfile.mkstemp(prefix=f"{self.run_root.name}_", suffix=".tar.gz")
@@ -368,14 +379,6 @@ class BenchmarkRunner:
                 shutil.rmtree(child)
             else:
                 child.unlink()
-
-    def _atexit_sync(self) -> None:
-        if not self.sync_enabled or self._sync_completed:
-            return
-        try:
-            self._sync_results_to_s3()
-        except Exception as exc:
-            print(f"Warning: failed to sync run directory during shutdown: {exc}")
 
     def setup_git_user(self) -> None:
         subprocess.run(
@@ -476,6 +479,7 @@ class BenchmarkRunner:
             "head": self.git_rev_parse("HEAD"),
         }
         self.state.update_manifest_repo(repo_meta)
+        self._checkpoint_state("repo-ready")
 
     def _run_repo_setup_commands(self) -> None:
         setup = self.repo_config.get("setup", {})
@@ -548,6 +552,7 @@ class BenchmarkRunner:
 
         story_files = sorted([path.name for path in self.stories_dir.glob("*.md")])
         self.state.set_story_order(story_files)
+        self._checkpoint_state("stories-ready")
 
     async def implement_story(self, story: str, story_file: str) -> None:
         self.current_story_file = story_file
@@ -712,6 +717,7 @@ class BenchmarkRunner:
                         summary = f"Result: Fail\n\nImplementation error: {exc}\n"
                         self.state.write_result(story_file, summary)
                         self.state.mark_failed(story_file, str(exc))
+                        self._checkpoint_state(f"{story_file}-implement-failed")
                         continue
 
                     after_sha = self.commit_story_changes(story_file)
@@ -720,6 +726,7 @@ class BenchmarkRunner:
                     )
                     status = self.state.mark_evaluating(story_file)
                     phase = status.get("phase", "evaluating")
+                    self._checkpoint_state(f"{story_file}-implement-committed")
                 elif self.skip_implement and phase in {"pending", "implementing"}:
                     print(
                         f"SKIP_IMPLEMENT=1 set; marking {story_file} ready for evaluation."
@@ -753,6 +760,7 @@ class BenchmarkRunner:
                         f"Result already present for {story_file}; marking as completed."
                     )
                     self.state.mark_completed(story_file)
+                    self._checkpoint_state(f"{story_file}-evaluate-auto-completed")
                     continue
 
                 if status.get("phase") in {"evaluating", "implementing", "pending"}:
@@ -763,6 +771,7 @@ class BenchmarkRunner:
                         summary = f"Result: Fail\n\nEvaluation error: {exc}\n"
                         self.state.write_result(story_file, summary)
                         self.state.mark_failed(story_file, str(exc))
+                        self._checkpoint_state(f"{story_file}-evaluate-failed")
                         continue
 
                     repo_result = self.repo_dir / "result.md"
@@ -776,6 +785,7 @@ class BenchmarkRunner:
                             "Result: Success\n\nNo detailed report provided.",
                         )
                     self.state.mark_completed(story_file)
+                    self._checkpoint_state(f"{story_file}-evaluate-completed")
 
             finally:
                 self.current_story_file = None
@@ -856,8 +866,8 @@ class BenchmarkRunner:
         await self.run_benchmark()
 
     def finalize(self) -> None:
-        if self.sync_enabled and not self._sync_completed:
-            self._sync_results_to_s3()
+        if self.sync_enabled:
+            self._checkpoint_state("finalize")
 
     def mark_success(self) -> None:
         if self._final_status != "running":
