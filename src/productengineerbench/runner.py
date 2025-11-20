@@ -1,22 +1,25 @@
+from __future__ import annotations
+
 import asyncio
 import os
-import shlex
-import shutil
+import logging
 import signal
 import subprocess
 import tempfile
-import time
+import shutil
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import quote
 
-import yaml
+import structlog
 from openhands.sdk import LLM, Conversation
 from openhands.tools.preset.default import get_default_agent
 from pydantic import SecretStr
 
+from .clients import Phase, S3SyncClient, SubprocessGitClient, TarArchiver
+from .config import load_repo_settings, load_storymachine_settings
 from .state import RunState
 
 
@@ -26,6 +29,31 @@ class CodeImplementationError(Exception):
 
 class UATEvaluationError(Exception):
     pass
+
+
+def configure_logging() -> None:
+    """Configure structlog with either console or JSON output.
+
+    Default is console output; set LOG_FORMAT=json to emit structured logs.
+    """
+
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    log_format = os.environ.get("LOG_FORMAT", "console").lower()
+    processors = [
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.add_log_level,
+    ]
+    if log_format == "json":
+        processors.append(structlog.processors.JSONRenderer())
+    else:
+        processors.append(structlog.dev.ConsoleRenderer())
+
+    structlog.configure(
+        processors=processors,
+        context_class=dict,
+        wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
+        cache_logger_on_first_use=True,
+    )
 
 
 def _env_int(name: str, default: int) -> int:
@@ -51,6 +79,8 @@ class BenchmarkRunner:
         self.storymachine_config = storymachine_config
         self.repo_config_path = repo_config_path
         self.storymachine_config_path = storymachine_config_path
+
+        self.logger = structlog.get_logger("productengineerbench.runner")
 
         self.sync_bucket = os.environ.get("SYNC_BUCKET")
         self.sync_prefix = os.environ.get("SYNC_PREFIX")
@@ -80,16 +110,13 @@ class BenchmarkRunner:
         self.results_root = Path(os.environ.get("RESULTS_DIR", "/results")).expanduser()
         self.run_root = self._resolve_run_root()
         self.run_id = os.environ.get("RUN_ID") or self.run_root.name
+        self.logger = self.logger.bind(run_id=self.run_id)
 
-        self._normalize_aws_env()
-        self.sync_enabled = bool(self.sync_bucket and self.sync_prefix)
+        self.sync_client = S3SyncClient(self.sync_bucket) if self.sync_bucket else None
+        self.sync_enabled = bool(self.sync_client and self.sync_prefix)
         self._final_status = "running"
         self._sigterm_handler_registered = False
-        self._aws_cli_path: Optional[str] = None
-
-        if self.sync_enabled or self.resume_prefix:
-            self._ensure_aws_cli()
-        if self.resume_prefix:
+        if self.resume_prefix and self.sync_client:
             self._download_resume_state()
 
         self.state = RunState(
@@ -104,7 +131,7 @@ class BenchmarkRunner:
 
         self.repo_dir = self.state.repo_dir
         self.stories_dir = self.state.stories_dir
-        self.current_story_file: Optional[str] = None
+        self.git = SubprocessGitClient(self.repo_dir)
 
         self.implementer_model = os.environ.get("IMPLEMENTER_MODEL", "claude-haiku-4-5")
         self.evaluator_model = os.environ.get("EVALUATOR_MODEL", "claude-sonnet-4-5")
@@ -205,180 +232,49 @@ class BenchmarkRunner:
         self.mark_cancelled()
         raise SystemExit(130)
 
-    def _normalize_aws_env(self) -> None:
-        def _strip_quotes(value: str) -> str:
-            trimmed = value.strip()
-            if len(trimmed) >= 2 and (
-                (trimmed.startswith('"') and trimmed.endswith('"'))
-                or (trimmed.startswith("'") and trimmed.endswith("'"))
-            ):
-                return trimmed[1:-1].strip()
-            return value
-
-        for key in (
-            "AWS_PROFILE",
-            "AWS_SHARED_CREDENTIALS_FILE",
-            "AWS_CONFIG_FILE",
-        ):
-            value = os.environ.get(key)
-            if not value:
-                continue
-            cleaned = _strip_quotes(value)
-            if cleaned != value:
-                os.environ[key] = cleaned
-                print(f"[S3] Normalized {key} to {cleaned}")
-
-        creds_path = os.environ.get("AWS_SHARED_CREDENTIALS_FILE")
-        if creds_path and not Path(creds_path).exists():
-            print(f"[S3] Warning: AWS_SHARED_CREDENTIALS_FILE not found at {creds_path}")
-
-        config_path = os.environ.get("AWS_CONFIG_FILE")
-        if config_path and not Path(config_path).exists():
-            print(f"[S3] Warning: AWS_CONFIG_FILE not found at {config_path}")
-
-    def _ensure_aws_cli(self) -> str:
-        if self._aws_cli_path:
-            return self._aws_cli_path
-        aws_path = shutil.which("aws")
-        if not aws_path:
-            raise RuntimeError(
-                "AWS CLI not found on PATH while SYNC/RESUME is enabled. "
-                "Install awscli in the runner image or unset SYNC_BUCKET/SYNC_PREFIX."
-            )
-        self._aws_cli_path = aws_path
-        print(f"[S3] Detected aws CLI at {aws_path}")
-        return aws_path
-
-    def _s3_uri(self, prefix: str) -> str:
-        if not self.sync_bucket:
-            raise ValueError("SYNC_BUCKET must be set for S3 sync")
-        clean = prefix.lstrip("/")
-        return f"s3://{self.sync_bucket}/{clean}"
-
-    def _tarball_key(self, prefix: str) -> str:
-        clean = prefix.rstrip("/")
-        return f"{clean}.tar.gz"
-
-    def _tarball_uri(self, prefix: str) -> str:
-        return self._s3_uri(self._tarball_key(prefix))
-
-    def _aws_sync(
-        self, source: str, dest: str, *, delete: bool = False, label: str = "sync"
-    ) -> None:
-        aws_exe = self._ensure_aws_cli()
-        cmd = [aws_exe, "s3", "sync", source, dest, "--only-show-errors"]
-        if delete:
-            cmd.append("--delete")
-        printable = " ".join(shlex.quote(token) for token in cmd)
-        print(f"[S3:{label}] {printable}")
-        start = time.monotonic()
-        try:
-            subprocess.run(cmd, check=True)
-        except subprocess.CalledProcessError as exc:
-            elapsed = time.monotonic() - start
-            print(
-                f"[S3:{label}] aws exited with {exc.returncode} after {elapsed:.1f}s"
-            )
-            raise
-        elapsed = time.monotonic() - start
-        print(f"[S3:{label}] Completed in {elapsed:.1f}s")
-
-    def _aws_cp(self, local_path: str, remote_uri: str, *, upload: bool, label: str) -> None:
-        aws_exe = self._ensure_aws_cli()
-        if upload:
-            cmd = [aws_exe, "s3", "cp", local_path, remote_uri]
-        else:
-            cmd = [aws_exe, "s3", "cp", remote_uri, local_path]
-        printable = " ".join(shlex.quote(token) for token in cmd)
-        print(f"[S3:{label}] {printable}")
-        start = time.monotonic()
-        try:
-            subprocess.run(cmd, check=True)
-        except subprocess.CalledProcessError as exc:
-            elapsed = time.monotonic() - start
-            print(
-                f"[S3:{label}] aws exited with {exc.returncode} after {elapsed:.1f}s"
-            )
-            raise
-        elapsed = time.monotonic() - start
-        print(f"[S3:{label}] Completed in {elapsed:.1f}s")
-
-    def _download_resume_state(self) -> None:
-        if not self.resume_prefix:
-            return
-        archive_uri = self._tarball_uri(self.resume_prefix)
-        self._download_and_extract_archive(archive_uri)
-
-    def _sync_results_to_s3(self) -> None:
-        if not self.sync_enabled:
-            return
-        dest = self._s3_uri(self.sync_prefix or "")
-        print(f"Uploading run directory {self.run_root} to {dest}")
-        self._aws_sync(str(self.run_root), dest, delete=True, label="upload")
-        archive_path = self._create_run_archive()
-        try:
-            archive_dest = self._tarball_uri(self.sync_prefix or "")
-            print(f"Uploading run archive {archive_path} to {archive_dest}")
-            self._aws_cp(str(archive_path), archive_dest, upload=True, label="upload-archive")
-        finally:
-            try:
-                archive_path.unlink()
-            except FileNotFoundError:
-                pass
-
     def _checkpoint_state(self, reason: str) -> None:
-        if not self.sync_enabled:
+        if not self.sync_client or not self.sync_prefix:
             return
         try:
             self.state.flush()
             self.state.record_checkpoint(reason, extra={"run_id": self.run_id})
-        except Exception as exc:  # narrow downside: never block sync attempt
-            print(f"[Checkpoint] Failed to record checkpoint {reason}: {exc}")
-        try:
-            self._sync_results_to_s3()
-            print(f"[Checkpoint] Completed sync for {reason}")
         except Exception as exc:
-            print(f"[Checkpoint] Sync failed for {reason}: {exc}")
+            self.logger.warning(
+                "checkpoint_record_failed", reason=reason, error=str(exc)
+            )
+        try:
+            sync_prefix = self.sync_prefix or ""
+            self.sync_client.sync_directory(self.run_root, sync_prefix, delete=True)
+            archive = TarArchiver.create_archive(self.run_root)
+            try:
+                archive_key = f"{sync_prefix.rstrip('/')}.tar.gz"
+                self.sync_client.upload_file(archive, archive_key)
+            finally:
+                archive.unlink(missing_ok=True)
+            self.logger.info("checkpoint_synced", reason=reason)
+        except Exception as exc:
+            self.logger.warning("checkpoint_sync_failed", reason=reason, error=str(exc))
 
-    def _create_run_archive(self) -> Path:
-        fd, tmp_path = tempfile.mkstemp(prefix=f"{self.run_root.name}_", suffix=".tar.gz")
-        os.close(fd)
-        tar_path = Path(tmp_path)
-        subprocess.run(
-            ["tar", "-czf", str(tar_path), "-C", str(self.run_root), "."],
-            check=True,
-        )
-        return tar_path
-
-    def _download_and_extract_archive(self, archive_uri: str) -> None:
+    def _download_resume_state(self) -> None:
+        if not self.resume_prefix or not self.sync_client:
+            return
+        archive_key = f"{self.resume_prefix.rstrip('/')}.tar.gz"
         fd, tmp_path = tempfile.mkstemp(prefix="resume_", suffix=".tar.gz")
         os.close(fd)
-        local_path = Path(tmp_path)
+        archive_path = Path(tmp_path)
         try:
-            print(f"Restoring run directory from {archive_uri}")
-            self._aws_cp(str(local_path), archive_uri, upload=False, label="resume-archive")
-        except subprocess.CalledProcessError as exc:
-            local_path.unlink(missing_ok=True)
-            raise RuntimeError(
-                f"Resume archive {archive_uri} not found or inaccessible; cannot resume without it."
-            ) from exc
-        self._wipe_run_root()
-        subprocess.run(
-            ["tar", "-xzf", str(local_path), "-C", str(self.run_root)],
-            check=True,
-        )
-        print("Resume restored from archive.")
-        local_path.unlink(missing_ok=True)
-
-    def _wipe_run_root(self) -> None:
-        if not self.run_root.exists():
-            self.run_root.mkdir(parents=True, exist_ok=True)
-            return
-        for child in self.run_root.iterdir():
-            if child.is_dir():
-                shutil.rmtree(child)
-            else:
-                child.unlink()
+            self.logger.info("resume_download_start", key=archive_key)
+            self.sync_client.download_file(archive_key, archive_path)
+            if self.run_root.exists():
+                for child in self.run_root.iterdir():
+                    if child.is_dir():
+                        shutil.rmtree(child)
+                    else:
+                        child.unlink()
+            TarArchiver.extract_archive(archive_path, self.run_root)
+            self.logger.info("resume_download_complete", path=str(self.run_root))
+        finally:
+            archive_path.unlink(missing_ok=True)
 
     def setup_git_user(self) -> None:
         subprocess.run(
@@ -409,41 +305,11 @@ class BenchmarkRunner:
         )
         credentials_file.chmod(0o600)
 
-    def _git(
-        self,
-        *args: str,
-        check: bool = True,
-        capture_output: bool = False,
-        text: bool = True,
-    ) -> subprocess.CompletedProcess:
-        return subprocess.run(
-            ["git", *args],
-            cwd=self.repo_dir,
-            check=check,
-            capture_output=capture_output,
-            text=text,
-        )
-
-    def git_rev_parse(self, ref: str = "HEAD") -> Optional[str]:
-        try:
-            result = self._git("rev-parse", ref, capture_output=True)
-        except subprocess.CalledProcessError:
-            return None
-        return result.stdout.strip()
-
-    def git_has_changes(self) -> bool:
-        result = self._git("status", "--porcelain", capture_output=True)
-        return bool(result.stdout.strip())
-
     def commit_story_changes(self, story_file: str) -> Optional[str]:
-        if not self.git_has_changes():
-            return self.git_rev_parse("HEAD")
-        try:
-            self._git("add", "--all")
-            self._git("commit", "-m", f"Implement story: {story_file}")
-        except subprocess.CalledProcessError as exc:
-            print(f"Warning: failed to commit changes for {story_file}: {exc}")
-        return self.git_rev_parse("HEAD")
+        sha = self.git.commit_all(f"Implement story: {story_file}")
+        if sha is None:
+            self.logger.warning("git_commit_failed", story=story_file)
+        return sha
 
     def setup_repository(self) -> None:
         self.setup_git_credentials()
@@ -454,20 +320,18 @@ class BenchmarkRunner:
 
         if self.resume and (self.repo_dir / ".git").exists():
             print("Reusing existing repository checkout")
-            self._git("fetch", "--all", "--tags", "--prune", check=False)
-            self._git("checkout", branch)
+            self.git.fetch_all()
+            self.git.checkout(branch)
             resume_sha = self.state.determine_resume_sha()
             if resume_sha:
-                self._git("reset", "--hard", resume_sha)
+                self.git.reset_hard(resume_sha)
         else:
             if self.repo_dir.exists() and any(self.repo_dir.iterdir()):
                 raise RuntimeError(
                     f"Repository directory {self.repo_dir} already exists and is not empty."
                 )
-            subprocess.run(
-                ["git", "clone", repo_cfg["url"], str(self.repo_dir)], check=True
-            )
-            self._git("checkout", "-B", branch, repo_cfg["revision"])
+            self.git.clone(repo_cfg["url"], self.repo_dir)
+            self.git.checkout(branch, repo_cfg["revision"])
 
         self._run_repo_setup_commands()
 
@@ -476,7 +340,7 @@ class BenchmarkRunner:
             "url": repo_cfg.get("url"),
             "base_revision": repo_cfg.get("revision"),
             "branch": branch,
-            "head": self.git_rev_parse("HEAD"),
+            "head": self.git.rev_parse("HEAD"),
         }
         self.state.update_manifest_repo(repo_meta)
         self._checkpoint_state("repo-ready")
@@ -555,7 +419,6 @@ class BenchmarkRunner:
         self._checkpoint_state("stories-ready")
 
     async def implement_story(self, story: str, story_file: str) -> None:
-        self.current_story_file = story_file
         self.state.start_session(story_file, "implement")
 
         api_key = os.environ.get("IMPLEMENTER_LLM_API_KEY")
@@ -583,7 +446,9 @@ class BenchmarkRunner:
 
         def event_callback(event: Any) -> None:
             nonlocal has_error
-            asyncio.run_coroutine_threadsafe(self.log_message("implement", event), loop)
+            asyncio.run_coroutine_threadsafe(
+                self.log_message(story_file, "implement", event), loop
+            )
             self.print_event_human_readable(event)
             event_dict = (
                 event.to_dict()
@@ -603,7 +468,7 @@ class BenchmarkRunner:
             callbacks=[event_callback],
         )
 
-        await self.log_message("implement", {"type": "user", "content": user_message})
+        await self.log_message(story_file, "implement", {"type": "user", "content": user_message})
         conversation.send_message(user_message)
         await loop.run_in_executor(None, conversation.run)
 
@@ -611,7 +476,6 @@ class BenchmarkRunner:
             raise CodeImplementationError("Code implementation failed with errors")
 
     async def evaluate_acceptance_criteria(self, story: str, story_file: str) -> None:
-        self.current_story_file = story_file
         self.state.start_session(story_file, "evaluate")
 
         api_key = os.environ.get("EVALUATOR_LLM_API_KEY")
@@ -637,7 +501,9 @@ class BenchmarkRunner:
 
         def event_callback(event: Any) -> None:
             nonlocal has_error
-            asyncio.run_coroutine_threadsafe(self.log_message("evaluate", event), loop)
+            asyncio.run_coroutine_threadsafe(
+                self.log_message(story_file, "evaluate", event), loop
+            )
             self.print_event_human_readable(event)
             event_dict = (
                 event.to_dict()
@@ -657,7 +523,7 @@ class BenchmarkRunner:
             callbacks=[event_callback],
         )
 
-        await self.log_message("evaluate", {"type": "user", "content": user_message})
+        await self.log_message(story_file, "evaluate", {"type": "user", "content": user_message})
         conversation.send_message(user_message)
         await loop.run_in_executor(None, conversation.run)
 
@@ -665,140 +531,137 @@ class BenchmarkRunner:
             raise UATEvaluationError("UAT evaluation failed with errors")
 
     async def run_benchmark(self) -> None:
-        story_order = self.state.get_story_order()
+        story_order = self.state.get_story_order() or self.state.rebuild_story_index_from_files()
         if not story_order:
-            story_order = self.state.rebuild_story_index_from_files()
-        if not story_order:
-            print("No stories found; nothing to run.")
+            self.logger.info("no_stories")
             return
 
         for story_file in story_order:
             story_path = self.stories_dir / story_file
             if not story_path.exists():
-                print(f"Story file {story_file} missing, skipping.")
+                self.logger.warning("story_missing", story=story_file)
                 continue
 
             status = self.state.ensure_story_status(story_file)
-            phase = status.get("phase", "pending")
-
-            if phase == "completed":
-                print(f"Story {story_file} already completed; skipping.")
+            phase = self._normalize_phase(story_file, status)
+            if phase is None:
                 continue
 
-            if phase == "failed":
-                if not self.force_retry_failed:
-                    print(
-                        f"Story {story_file} previously failed; skipping (set FORCE_RETRY_FAILED=1 to retry)."
-                    )
-                    continue
-                commits = status.get("commits") or {}
-                if commits.get("after_implement"):
-                    phase = "evaluating"
-                    status = self.state.update_status(
-                        story_file, phase="evaluating", error=None
-                    )
-                else:
-                    phase = "pending"
-                    status = self.state.update_status(
-                        story_file, phase="pending", error=None
-                    )
-
             story_text = story_path.read_text()
+            phase = await self._maybe_implement(story_file, story_text, phase)
+            if phase is None:
+                continue
+            await self._maybe_evaluate(story_file, story_text, phase)
 
-            try:
-                if not self.skip_implement and phase in {"pending", "implementing"}:
-                    print(f"Implementing story: {story_file}")
-                    self.state.mark_implementing(story_file)
-                    before_sha = self.git_rev_parse("HEAD")
-                    try:
-                        await self.implement_story(story_text, story_file)
-                    except CodeImplementationError as exc:
-                        self.state.record_commits(story_file, before=before_sha)
-                        summary = f"Result: Fail\n\nImplementation error: {exc}\n"
-                        self.state.write_result(story_file, summary)
-                        self.state.mark_failed(story_file, str(exc))
-                        self._checkpoint_state(f"{story_file}-implement-failed")
-                        continue
+    def _normalize_phase(self, story_file: str, status: Dict[str, Any]) -> Optional[Phase]:
+        phase = Phase(status.get("phase", Phase.PENDING.value))
+        if phase is Phase.COMPLETED:
+            self.logger.info("story_skip_completed", story=story_file)
+            return None
+        if phase is Phase.FAILED:
+            if not self.force_retry_failed:
+                self.logger.info(
+                    "story_skip_failed", story=story_file, hint="FORCE_RETRY_FAILED=1"
+                )
+                return None
+            commits = status.get("commits") or {}
+            if commits.get("after_implement"):
+                phase = Phase.EVALUATING
+                self.state.update_status(story_file, phase=Phase.EVALUATING.value, error=None)
+            else:
+                phase = Phase.PENDING
+                self.state.update_status(story_file, phase=Phase.PENDING.value, error=None)
+        return phase
 
-                    after_sha = self.commit_story_changes(story_file)
-                    self.state.record_commits(
-                        story_file, before=before_sha, after=after_sha
-                    )
-                    status = self.state.mark_evaluating(story_file)
-                    phase = status.get("phase", "evaluating")
-                    self._checkpoint_state(f"{story_file}-implement-committed")
-                elif self.skip_implement and phase in {"pending", "implementing"}:
-                    print(
-                        f"SKIP_IMPLEMENT=1 set; marking {story_file} ready for evaluation."
-                    )
-                    status = self.state.mark_evaluating(story_file)
-                    phase = status.get("phase", "evaluating")
+    async def _maybe_implement(self, story_file: str, story_text: str, phase: Phase) -> Optional[Phase]:
+        if self.skip_implement and phase in {Phase.PENDING, Phase.IMPLEMENTING}:
+            self.logger.info("story_mark_evaluating_skip_impl", story=story_file)
+            status = self.state.mark_evaluating(story_file)
+            return Phase(status.get("phase", Phase.EVALUATING.value))
 
-                if self.skip_evaluate:
-                    print(
-                        f"SKIP_EVALUATE=1 set; leaving {story_file} in phase={phase}."
-                    )
-                    continue
+        if self.skip_implement or phase not in {Phase.PENDING, Phase.IMPLEMENTING}:
+            return phase
 
-                status = self.state.ensure_story_status(story_file)
-                if status.get("phase") == "completed":
-                    print(f"Story {story_file} already completed; skipping evaluation.")
-                    continue
+        self.logger.info("story_implement_start", story=story_file)
+        self.state.mark_implementing(story_file)
+        before_sha = self.git.rev_parse("HEAD")
+        try:
+            await self.implement_story(story_text, story_file)
+        except CodeImplementationError as exc:
+            self.state.record_commits(story_file, before=before_sha)
+            summary = f"Result: Fail\n\nImplementation error: {exc}\n"
+            self.state.write_result(story_file, summary)
+            self.state.mark_failed(story_file, str(exc))
+            self._checkpoint_state(f"{story_file}-implement-failed")
+            return None
 
-                if status.get("phase") == "implementing":
-                    print(
-                        f"Story {story_file} still implementing; skipping evaluation this pass."
-                    )
-                    continue
+        after_sha = self.commit_story_changes(story_file)
+        self.state.record_commits(story_file, before=before_sha, after=after_sha)
+        status = self.state.mark_evaluating(story_file)
+        phase = Phase(status.get("phase", Phase.EVALUATING.value))
+        self._checkpoint_state(f"{story_file}-implement-committed")
+        return phase
 
-                if (
-                    status.get("phase") == "evaluating"
-                    and self.evaluate_if_result_present
-                    and self.state.story_result_exists(story_file)
-                ):
-                    print(
-                        f"Result already present for {story_file}; marking as completed."
-                    )
-                    self.state.mark_completed(story_file)
-                    self._checkpoint_state(f"{story_file}-evaluate-auto-completed")
-                    continue
-
-                if status.get("phase") in {"evaluating", "implementing", "pending"}:
-                    print(f"Evaluating story: {story_file}")
-                    try:
-                        await self.evaluate_acceptance_criteria(story_text, story_file)
-                    except UATEvaluationError as exc:
-                        summary = f"Result: Fail\n\nEvaluation error: {exc}\n"
-                        self.state.write_result(story_file, summary)
-                        self.state.mark_failed(story_file, str(exc))
-                        self._checkpoint_state(f"{story_file}-evaluate-failed")
-                        continue
-
-                    repo_result = self.repo_dir / "result.md"
-                    if repo_result.exists():
-                        content = repo_result.read_text()
-                        self.state.write_result(story_file, content)
-                        repo_result.unlink()
-                    else:
-                        self.state.write_result(
-                            story_file,
-                            "Result: Success\n\nNo detailed report provided.",
-                        )
-                    self.state.mark_completed(story_file)
-                    self._checkpoint_state(f"{story_file}-evaluate-completed")
-
-            finally:
-                self.current_story_file = None
-
-    async def log_message(self, phase: str, event: Any) -> None:
-        if self.current_story_file is None:
+    async def _maybe_evaluate(self, story_file: str, story_text: str, phase: Phase) -> None:
+        if self.skip_evaluate:
+            self.logger.info("story_skip_evaluate", story=story_file, phase=phase.value)
             return
+
+        status = self.state.ensure_story_status(story_file)
+        if status.get("phase") == Phase.COMPLETED.value:
+            self.logger.info("story_skip_eval_completed", story=story_file)
+            return
+        if status.get("phase") == Phase.IMPLEMENTING.value:
+            self.logger.info("story_skip_eval_implementing", story=story_file)
+            return
+        if (
+            status.get("phase") == Phase.EVALUATING.value
+            and self.evaluate_if_result_present
+            and self.state.story_result_exists(story_file)
+        ):
+            self.logger.info("story_evaluate_skip_result_present", story=story_file)
+            self.state.mark_completed(story_file)
+            self._checkpoint_state(f"{story_file}-evaluate-auto-completed")
+            return
+
+        if status.get("phase") not in {
+            Phase.EVALUATING.value,
+            Phase.IMPLEMENTING.value,
+            Phase.PENDING.value,
+        }:
+            return
+
+        self.logger.info("story_evaluate_start", story=story_file)
+        try:
+            await self.evaluate_acceptance_criteria(story_text, story_file)
+        except UATEvaluationError as exc:
+            summary = f"Result: Fail\n\nEvaluation error: {exc}\n"
+            self.state.write_result(story_file, summary)
+            self.state.mark_failed(story_file, str(exc))
+            self._checkpoint_state(f"{story_file}-evaluate-failed")
+            return
+
+        repo_result = self.repo_dir / "result.md"
+        if repo_result.exists():
+            content = repo_result.read_text()
+            self.state.write_result(story_file, content)
+            repo_result.unlink()
+        else:
+            self.state.write_result(
+                story_file,
+                "Result: Success\n\nNo detailed report provided.",
+            )
+        self.state.mark_completed(story_file)
+        self._checkpoint_state(f"{story_file}-evaluate-completed")
+
+    async def log_message(self, story_file: str, phase: str, event: Any) -> None:
         event_type, content = self._serialize_event(event)
         await asyncio.to_thread(
-            self.state.log_event, self.current_story_file, phase, event_type, content
+            self.state.log_event, story_file, phase, event_type, content
         )
 
-    def _serialize_event(self, event: Any) -> Tuple[str, Any]:
+    @staticmethod
+    def _serialize_event(event: Any) -> Tuple[str, Any]:
         def _to_jsonable(obj: Any) -> Any:
             if obj is None or isinstance(obj, (str, int, float, bool)):
                 return obj
@@ -808,8 +671,9 @@ class BenchmarkRunner:
                 return {str(_to_jsonable(k)): _to_jsonable(v) for k, v in obj.items()}
             if is_dataclass(obj) and not isinstance(obj, type):
                 return _to_jsonable(asdict(obj))
-            if hasattr(obj, "to_dict"):
-                return _to_jsonable(obj.to_dict())
+            to_dict = getattr(obj, "to_dict", None)
+            if callable(to_dict):
+                return _to_jsonable(to_dict())
             if hasattr(obj, "__dict__"):
                 return _to_jsonable(vars(obj))
             return str(obj)
@@ -818,7 +682,7 @@ class BenchmarkRunner:
         if isinstance(event, dict):
             event_type = event.get("type", event_type)
             content = _to_jsonable(event)
-        elif hasattr(event, "to_dict"):
+        elif callable(getattr(event, "to_dict", None)):
             payload = event.to_dict()
             event_type = payload.get("event_type", event_type)
             content = _to_jsonable(payload)
@@ -826,7 +690,8 @@ class BenchmarkRunner:
             content = _to_jsonable(event)
         return event_type, content
 
-    def print_event_human_readable(self, event: Any) -> None:
+    @staticmethod
+    def print_event_human_readable(event: Any) -> None:
         if isinstance(event, dict):
             print(f"[User] {event.get('content', event)}")
             return
@@ -856,13 +721,13 @@ class BenchmarkRunner:
         print(f"[Event] {str(event)}")
 
     async def execute(self) -> None:
-        print("Setting up repository...")
+        self.logger.info("repo_setup_start")
         self.setup_repository()
 
-        print("Generating stories...")
+        self.logger.info("story_generation_start")
         self.generate_stories()
 
-        print("Running benchmark...")
+        self.logger.info("benchmark_start")
         await self.run_benchmark()
 
     def finalize(self) -> None:
@@ -893,13 +758,17 @@ class BenchmarkRunner:
 
 
 def run() -> None:
+    configure_logging()
     repo_config_path = Path(os.environ.get("REPO_CONFIG", "/data/repo.yaml"))
     storymachine_config_path = Path(
         os.environ.get("STORYMACHINE_CONFIG", "/config/storymachine.yaml")
     )
 
-    repo_config = yaml.safe_load(repo_config_path.read_text())
-    storymachine_config = yaml.safe_load(storymachine_config_path.read_text())
+    repo_settings = load_repo_settings(repo_config_path)
+    storymachine_settings = load_storymachine_settings(storymachine_config_path)
+
+    repo_config = repo_settings.model_dump(mode="python")
+    storymachine_config = storymachine_settings.model_dump(mode="python")
 
     runner = BenchmarkRunner(
         storymachine_config=storymachine_config,

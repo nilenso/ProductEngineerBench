@@ -421,7 +421,9 @@ class RunState:
         path.mkdir(parents=True, exist_ok=True)
         return path
 
-    def record_checkpoint(self, reason: str, *, extra: Optional[Dict[str, Any]] = None) -> None:
+    def record_checkpoint(
+        self, reason: str, *, extra: Optional[Dict[str, Any]] = None
+    ) -> None:
         """Append a checkpoint marker for auditing sync attempts.
 
         The marker is intentionally lightweight; it should never throw

@@ -356,3 +356,20 @@ No changes required. The runner writes to `/results` which is already mounted; r
 - Checkpointing agent/tool state beyond JSONL transcripts.
 - Optional SQLite index over JSONL for faster analytics.
 - Content-addressable cache of evaluations by repo SHA + story hash.
+
+## Code Alignment Status (Nov 20, 2025)
+
+This repository’s current implementation (entrypoint `productengineerbench.runner`) matches the spec in these areas:
+
+- Checkpoints emitted at init, repo-ready, stories-ready, implement-committed/fail, evaluate-completed/fail, and evaluate-auto-completed; each checkpoint flushes state and uploads a run archive.
+- `status.json` and `stories_index.json` written atomically via temp + rename; event logs are append-only JSONL.
+- Resume logic honors `RESUME`/`FORCE_RESUME` and prefers the latest commit SHAs recorded per story.
+- Repo/stories live under the run directory; configs are copied into `configs/` for durability.
+
+Known deviations to address:
+
+- S3 syncing now uses `s3fs` with best-effort delete rather than `aws s3 sync --delete`; remote extras may linger if listing fails.
+- Resume tar keys are `<prefix>.tar.gz` uploaded via `s3fs`, not `aws cp`; large buckets may need explicit cleanup tooling.
+- `evaluate_if_result_present=1` marks completed without re-running evaluation when a result file exists; spec allows rerun-by-default—confirm intended default.
+- No explicit per-phase durable seq guarding beyond JSONL append; concurrent workers remain unsupported (spec notes single worker but we have no file locks yet).
+- Structured logging added, but logs are still mirrored only via checkpoints; no continuous streaming channel is in place.

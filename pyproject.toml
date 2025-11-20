@@ -10,6 +10,9 @@ requires-python = ">=3.13"
 dependencies = [
     "openhands-sdk",
     "openhands-tools",
+    "pydantic-settings>=2.11.0",
+    "s3fs>=2025.10.0",
+    "structlog>=25.5.0",
 ]
 
 [project.scripts]
@@ -23,6 +26,8 @@ build-backend = "uv_build"
 dev = [
     "marimo>=0.16.1",
     "openai>=1.99.9",
+    "pyright>=1.1.407",
+    "pytest>=9.0.1",
     "ruff>=0.13.1",
 ]
 
