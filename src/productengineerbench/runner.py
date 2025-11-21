@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import os
 import logging
 import signal
@@ -418,7 +417,7 @@ class BenchmarkRunner:
         self.state.set_story_order(story_files)
         self._checkpoint_state("stories-ready")
 
-    async def implement_story(self, story: str, story_file: str) -> None:
+    def implement_story(self, story: str, story_file: str) -> None:
         self.state.start_session(story_file, "implement")
 
         api_key = os.environ.get("IMPLEMENTER_LLM_API_KEY")
@@ -440,15 +439,11 @@ class BenchmarkRunner:
 
         prompt_path = Path(__file__).parent / "prompts" / "implementation.txt"
         user_message = prompt_path.read_text().format(story=story)
-
-        loop = asyncio.get_event_loop()
         has_error = False
 
         def event_callback(event: Any) -> None:
             nonlocal has_error
-            asyncio.run_coroutine_threadsafe(
-                self.log_message(story_file, "implement", event), loop
-            )
+            self.log_message(story_file, "implement", event)
             self.print_event_human_readable(event)
             event_dict = (
                 event.to_dict()
@@ -468,14 +463,16 @@ class BenchmarkRunner:
             callbacks=[event_callback],
         )
 
-        await self.log_message(story_file, "implement", {"type": "user", "content": user_message})
+        self.log_message(
+            story_file, "implement", {"type": "user", "content": user_message}
+        )
         conversation.send_message(user_message)
-        await loop.run_in_executor(None, conversation.run)
+        conversation.run()
 
         if has_error:
             raise CodeImplementationError("Code implementation failed with errors")
 
-    async def evaluate_acceptance_criteria(self, story: str, story_file: str) -> None:
+    def evaluate_acceptance_criteria(self, story: str, story_file: str) -> None:
         self.state.start_session(story_file, "evaluate")
 
         api_key = os.environ.get("EVALUATOR_LLM_API_KEY")
@@ -495,15 +492,11 @@ class BenchmarkRunner:
 
         prompt_path = Path(__file__).parent / "prompts" / "evaluation.txt"
         user_message = prompt_path.read_text().format(story=story)
-
-        loop = asyncio.get_event_loop()
         has_error = False
 
         def event_callback(event: Any) -> None:
             nonlocal has_error
-            asyncio.run_coroutine_threadsafe(
-                self.log_message(story_file, "evaluate", event), loop
-            )
+            self.log_message(story_file, "evaluate", event)
             self.print_event_human_readable(event)
             event_dict = (
                 event.to_dict()
@@ -523,15 +516,19 @@ class BenchmarkRunner:
             callbacks=[event_callback],
         )
 
-        await self.log_message(story_file, "evaluate", {"type": "user", "content": user_message})
+        self.log_message(
+            story_file, "evaluate", {"type": "user", "content": user_message}
+        )
         conversation.send_message(user_message)
-        await loop.run_in_executor(None, conversation.run)
+        conversation.run()
 
         if has_error:
             raise UATEvaluationError("UAT evaluation failed with errors")
 
-    async def run_benchmark(self) -> None:
-        story_order = self.state.get_story_order() or self.state.rebuild_story_index_from_files()
+    def run_benchmark(self) -> None:
+        story_order = (
+            self.state.get_story_order() or self.state.rebuild_story_index_from_files()
+        )
         if not story_order:
             self.logger.info("no_stories")
             return
@@ -548,12 +545,14 @@ class BenchmarkRunner:
                 continue
 
             story_text = story_path.read_text()
-            phase = await self._maybe_implement(story_file, story_text, phase)
+            phase = self._maybe_implement(story_file, story_text, phase)
             if phase is None:
                 continue
-            await self._maybe_evaluate(story_file, story_text, phase)
+            self._maybe_evaluate(story_file, story_text, phase)
 
-    def _normalize_phase(self, story_file: str, status: Dict[str, Any]) -> Optional[Phase]:
+    def _normalize_phase(
+        self, story_file: str, status: Dict[str, Any]
+    ) -> Optional[Phase]:
         phase = Phase(status.get("phase", Phase.PENDING.value))
         if phase is Phase.COMPLETED:
             self.logger.info("story_skip_completed", story=story_file)
@@ -567,13 +566,19 @@ class BenchmarkRunner:
             commits = status.get("commits") or {}
             if commits.get("after_implement"):
                 phase = Phase.EVALUATING
-                self.state.update_status(story_file, phase=Phase.EVALUATING.value, error=None)
+                self.state.update_status(
+                    story_file, phase=Phase.EVALUATING.value, error=None
+                )
             else:
                 phase = Phase.PENDING
-                self.state.update_status(story_file, phase=Phase.PENDING.value, error=None)
+                self.state.update_status(
+                    story_file, phase=Phase.PENDING.value, error=None
+                )
         return phase
 
-    async def _maybe_implement(self, story_file: str, story_text: str, phase: Phase) -> Optional[Phase]:
+    def _maybe_implement(
+        self, story_file: str, story_text: str, phase: Phase
+    ) -> Optional[Phase]:
         if self.skip_implement and phase in {Phase.PENDING, Phase.IMPLEMENTING}:
             self.logger.info("story_mark_evaluating_skip_impl", story=story_file)
             status = self.state.mark_evaluating(story_file)
@@ -586,7 +591,7 @@ class BenchmarkRunner:
         self.state.mark_implementing(story_file)
         before_sha = self.git.rev_parse("HEAD")
         try:
-            await self.implement_story(story_text, story_file)
+            self.implement_story(story_text, story_file)
         except CodeImplementationError as exc:
             self.state.record_commits(story_file, before=before_sha)
             summary = f"Result: Fail\n\nImplementation error: {exc}\n"
@@ -602,7 +607,7 @@ class BenchmarkRunner:
         self._checkpoint_state(f"{story_file}-implement-committed")
         return phase
 
-    async def _maybe_evaluate(self, story_file: str, story_text: str, phase: Phase) -> None:
+    def _maybe_evaluate(self, story_file: str, story_text: str, phase: Phase) -> None:
         if self.skip_evaluate:
             self.logger.info("story_skip_evaluate", story=story_file, phase=phase.value)
             return
@@ -633,7 +638,7 @@ class BenchmarkRunner:
 
         self.logger.info("story_evaluate_start", story=story_file)
         try:
-            await self.evaluate_acceptance_criteria(story_text, story_file)
+            self.evaluate_acceptance_criteria(story_text, story_file)
         except UATEvaluationError as exc:
             summary = f"Result: Fail\n\nEvaluation error: {exc}\n"
             self.state.write_result(story_file, summary)
@@ -654,11 +659,9 @@ class BenchmarkRunner:
         self.state.mark_completed(story_file)
         self._checkpoint_state(f"{story_file}-evaluate-completed")
 
-    async def log_message(self, story_file: str, phase: str, event: Any) -> None:
+    def log_message(self, story_file: str, phase: str, event: Any) -> None:
         event_type, content = self._serialize_event(event)
-        await asyncio.to_thread(
-            self.state.log_event, story_file, phase, event_type, content
-        )
+        self.state.log_event(story_file, phase, event_type, content)
 
     @staticmethod
     def _serialize_event(event: Any) -> Tuple[str, Any]:
@@ -720,7 +723,7 @@ class BenchmarkRunner:
             return
         print(f"[Event] {str(event)}")
 
-    async def execute(self) -> None:
+    def execute(self) -> None:
         self.logger.info("repo_setup_start")
         self.setup_repository()
 
@@ -728,7 +731,7 @@ class BenchmarkRunner:
         self.generate_stories()
 
         self.logger.info("benchmark_start")
-        await self.run_benchmark()
+        self.run_benchmark()
 
     def finalize(self) -> None:
         if self.sync_enabled:
@@ -777,7 +780,7 @@ def run() -> None:
         storymachine_config_path=storymachine_config_path,
     )
     try:
-        asyncio.run(runner.execute())
+        runner.execute()
     except KeyboardInterrupt:
         runner.mark_cancelled()
         raise
