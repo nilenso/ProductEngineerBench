@@ -49,6 +49,7 @@ Notes:
 
 - `repo/` and `stories/` move from ephemeral locations to inside `<run_root>` so they persist across container restarts.
 - Event logs remain JSONL and append-only; status is the source of truth for phase completion.
+- Structured console/JSON logs now provide canonical lifecycle markers (`repo_setup_*`, `story_generation_*`, `benchmark_*`, per-story `story_implement_*` and `story_evaluate_*`), each with `duration_ms` for coarse timing. LLM sessions emit `llm_session_start/complete` with model metadata only; command execution emits `{event}_start/complete/error` with `cmd`, `cwd`, `returncode`.
 
 ## Data Model & Schemas
 
@@ -142,7 +143,7 @@ Each line is a JSON object. Minimum fields:
   - Else create a new `<repo_name>_<timestamp>` directory.
 - Create `<run_root>/configs/` and copy `REPO_CONFIG` and `STORYMACHINE_CONFIG` into it.
 - Write `manifest.json` (first version) with tool and model metadata.
-- Immediately checkpoint (`reason="init"`) and sync the run directory to the remote target (if syncing is enabled).
+- Immediately checkpoint (`reason="init"`) and upload a run archive to the remote target (if syncing is enabled).
 
 ### Repository Setup
 
@@ -150,7 +151,7 @@ Each line is a JSON object. Minimum fields:
 - If `<run_root>/repo/.git` exists and `RESUME=1` is set: reuse; otherwise clone and checkout `repository.revision` to branch `eval_<name>`.
 - Run repo `setup.commands` (if any) and capture exported env from the script (existing behavior retained).
 - Record `base_revision` and `branch` in `manifest.json`.
-- Checkpoint (`reason="repo-ready"`) and sync.
+- Checkpoint (`reason="repo-ready"`) and upload an archive.
 
 ### Story Generation
 
@@ -158,7 +159,7 @@ Each line is a JSON object. Minimum fields:
 - If any `*.md` exists in `<run_root>/stories` and `RESUME=1`: skip generation.
 - Else run StoryMachine and write files to `<run_root>/stories`.
 - Write `stories_index.json` with the ordered list of `*.md`.
-- Checkpoint (`reason="stories-ready"`) and sync.
+- Checkpoint (`reason="stories-ready"`) and upload an archive.
 
 ### Per-Story Execution
 
@@ -173,10 +174,10 @@ For each story in `stories_index.json` order:
    - Run implement agent. On success:
      - Commit repo changes; capture `before` and `after_implement` SHAs.
      - Update status: `phase=evaluating`, set `updated_at`.
-     - **Checkpoint** immediately after the commit/status write (`reason="<story>-implement-committed"`) and sync.
+     - **Checkpoint** immediately after the commit/status write (`reason="<story>-implement-committed"`) and upload an archive.
    - On failure:
      - Update status: `phase=failed`, set `error` summary, keep logs.
-     - **Checkpoint** after writing the failure (`reason="<story>-implement-failed"`) and sync.
+     - **Checkpoint** after writing the failure (`reason="<story>-implement-failed"`) and upload an archive.
 
 3) Evaluate phase:
    - Skip if `phase` is `completed`.
@@ -185,11 +186,11 @@ For each story in `stories_index.json` order:
    - Run evaluator. On success:
      - Write `result.md` (from `<run_root>/repo/result.md` if produced, else synthesize a minimal report).
      - Update status: `phase=completed`, set `completed_at`.
-     - **Checkpoint** after writing the result/status (`reason="<story>-evaluate-completed"`) and sync.
+     - **Checkpoint** after writing the result/status (`reason="<story>-evaluate-completed"`) and upload an archive.
    - On failure:
      - Update status: `phase=failed`, set `error` summary.
-     - **Checkpoint** after writing the failure (`reason="<story>-evaluate-failed"`) and sync.
-    - If `evaluate_if_result_present` marks a story completed without running, checkpoint (`reason="<story>-evaluate-auto-completed"`) and sync.
+     - **Checkpoint** after writing the failure (`reason="<story>-evaluate-failed"`) and upload an archive.
+    - If `evaluate_if_result_present` marks a story completed without running, checkpoint (`reason="<story>-evaluate-auto-completed"`) and upload an archive.
 
 ### Atomic Writes
 
@@ -206,7 +207,7 @@ Decision per story on startup:
 - `evaluating` with no `completed_at`: run evaluate only.
 - `implementing` (no post-commit): rerun implement; commit may differ; update SHAs.
 - Absent `status.json`: treat as `pending`.
-- Because syncing now happens at each checkpoint, the previous exit-hook-based sync has been removed; durability is guaranteed by the per-checkpoint uploads.
+- Because archive uploads happen at each checkpoint, the previous exit-hook-based directory sync has been removed; durability is guaranteed by the per-checkpoint archives.
 
 Repo reuse:
 

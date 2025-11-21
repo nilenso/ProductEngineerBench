@@ -11,21 +11,17 @@ Usage: scripts/run_remote_benchmark.sh [options]
 Options:
   --context NAME          Docker context to use (default: do-bench or $BENCH_REMOTE_CONTEXT)
   --repo NAME             Repository slug from data/NAME.yaml (mutually exclusive with --config).
-  --config PATH           Remote path to a specific repo config file.
+  --config PATH           Local path to a specific repo config file (copied into run dir).
   --image IMAGE           Benchmark runner image (default: $BENCHMARK_IMAGE).
   --bucket NAME           S3 bucket for sync (default: $S3_BUCKET).
   --s3-prefix PREFIX      Destination prefix under the bucket (required).
   --resume-prefix PREFIX  Optional source prefix to resume from.
   --ssh-host HOST         Droplet hostname or IP (default: $BENCH_REMOTE_HOST).
   --ssh-user USER         SSH user (default: bench or $BENCH_REMOTE_USER).
-  --remote-repo PATH      Path to ProductEngineerBench on the droplet (default: /home/bench/ProductEngineerBench).
-  --repo-url URL          Git URL used when cloning the repo remotely (default: current origin).
-  --bench-ref REF         Git ref (branch/tag/SHA) to checkout before syncing (default: main or $BENCH_REMOTE_REF).
   --remote-results PATH   Directory for run artifacts on the droplet (default: /home/bench/results).
-  --env-file PATH         Remote .env path (default: /home/bench/.env.remote).
+  --env-file PATH         Local .env file to pass through Docker (default: ./\.env.remote or ./\.env).
   --container-name NAME   Name for docker --name (default: peb-runner).
   --stop-timeout SECONDS  Time docker stop waits before SIGKILL (default: 600).
-  --skip-refresh          Skip the git pull / uv sync step on the droplet.
   --cancel NAME           Stop an existing container via docker --context <NAME> stop.
   -h, --help              Show this message and exit.
 
@@ -36,6 +32,10 @@ Examples:
     --image registry.digitalocean.com/bench/runner:main \
     --bucket peb-results-prod \
     --s3-prefix remote/grand_central/2025-11-14T18-00Z
+
+Behavior:
+- Performs a single `/results` bind mount on the droplet. The selected repo YAML and `config/storymachine.yaml` are copied into that run directory before launch; the container reads them from `/results/data` and `/results/config`.
+- `--ssh-host` is required so the helper can create/copy into the run directory on the droplet.
 EOF
 }
 
@@ -49,12 +49,8 @@ resume_prefix=""
 ssh_host=${BENCH_REMOTE_HOST:-}
 ssh_user=${BENCH_REMOTE_USER:-bench}
 ssh_opts=${BENCH_REMOTE_SSH_OPTS:-}
-remote_repo_root=${REMOTE_REPO_ROOT:-}
 remote_results_root=${REMOTE_RESULTS_ROOT:-}
 remote_env_file=${REMOTE_ENV_FILE:-}
-remote_repo_url=${BENCH_REMOTE_REPO_URL:-}
-bench_ref=${BENCH_REMOTE_REF:-main}
-skip_refresh=0
 container_name="peb-runner"
 cancel_target=""
 remote_home=""
@@ -113,11 +109,6 @@ while [[ $# -gt 0 ]]; do
             ssh_user="$2"
             shift 2
             ;;
-        --remote-repo)
-            [[ $# -ge 2 ]] || { echo "--remote-repo requires an argument" >&2; exit 1; }
-            remote_repo_root="$2"
-            shift 2
-            ;;
         --remote-results)
             [[ $# -ge 2 ]] || { echo "--remote-results requires an argument" >&2; exit 1; }
             remote_results_root="$2"
@@ -126,16 +117,6 @@ while [[ $# -gt 0 ]]; do
         --env-file)
             [[ $# -ge 2 ]] || { echo "--env-file requires an argument" >&2; exit 1; }
             remote_env_file="$2"
-            shift 2
-            ;;
-        --repo-url)
-            [[ $# -ge 2 ]] || { echo "--repo-url requires an argument" >&2; exit 1; }
-            remote_repo_url="$2"
-            shift 2
-            ;;
-        --bench-ref)
-            [[ $# -ge 2 ]] || { echo "--bench-ref requires an argument" >&2; exit 1; }
-            bench_ref="$2"
             shift 2
             ;;
         --container-name)
@@ -151,10 +132,6 @@ while [[ $# -gt 0 ]]; do
             fi
             stop_timeout="$2"
             shift 2
-            ;;
-        --skip-refresh)
-            skip_refresh=1
-            shift
             ;;
         --cancel)
             [[ $# -ge 2 ]] || { echo "--cancel requires an argument" >&2; exit 1; }
@@ -216,14 +193,13 @@ if [[ -n "${ssh_host}" ]]; then
     ssh_target="${ssh_user}@${ssh_host}"
 fi
 
-if [[ -z "${remote_repo_root}" || -z "${remote_results_root}" ]]; then
+if [[ -z "${remote_results_root}" ]]; then
     if [[ -z "${ssh_target}" ]]; then
-        echo "Provide --ssh-host (or set REMOTE_REPO_ROOT/REMOTE_RESULTS_ROOT) so remote paths can be resolved." >&2
+        echo "Provide --ssh-host (or set REMOTE_RESULTS_ROOT) so remote paths can be resolved." >&2
         exit 1
     fi
     remote_home=$(ssh ${ssh_opts} "${ssh_target}" 'printf %s "$HOME"')
-    remote_repo_root=${remote_repo_root:-${remote_home}/ProductEngineerBench}
-    remote_results_root=${remote_results_root:-${remote_home}/results}
+    remote_results_root=${remote_home}/results
 fi
 
 if [[ -z "${remote_env_file}" && -n "${local_env_file}" ]]; then
@@ -234,17 +210,18 @@ if [[ -n "${remote_env_file}" && "${remote_env_file}" != /* ]]; then
     remote_env_file="${REPO_ROOT}/${remote_env_file#./}"
 fi
 
-if [[ -z "${remote_home}" && -n "${ssh_target}" ]]; then
-    remote_home=$(ssh ${ssh_opts} "${ssh_target}" 'printf %s "$HOME"')
+if [[ -n "${remote_env_file}" && ! -f "${remote_env_file}" ]]; then
+    echo "--env-file must point to a local file accessible to the Docker client: ${remote_env_file}" >&2
+    exit 1
 fi
 
-if [[ -z "${remote_repo_url}" ]]; then
-    if origin_url=$(git -C "${REPO_ROOT}" config --get remote.origin.url 2>/dev/null); then
-        remote_repo_url="${origin_url}"
-    fi
+if [[ -n "${remote_env_file}" && ! -f "${remote_env_file}" ]]; then
+    echo "--env-file must point to a local file; ${remote_env_file} not found on this machine." >&2
+    exit 1
 fi
-if [[ -z "${remote_repo_url}" ]]; then
-    remote_repo_url="https://github.com/nilenso/ProductEngineerBench.git"
+
+if [[ -z "${remote_home}" && -n "${ssh_target}" ]]; then
+    remote_home=$(ssh ${ssh_opts} "${ssh_target}" 'printf %s "$HOME"')
 fi
 
 repo_slug="${repo_name}"
@@ -259,61 +236,64 @@ remote_results_root=${remote_results_root%/}
 run_parent="${remote_results_root}/${repo_slug}"
 run_dir="${run_parent}/${run_id}"
 
-if (( ! skip_refresh )); then
-    if [[ -z "${ssh_target}" ]]; then
-        echo "Set BENCH_REMOTE_HOST or pass --ssh-host so the repository can be refreshed." >&2
-        exit 1
-    fi
-
-    printf "Refreshing %s on %s (ref=%s)...\n" "${remote_repo_root}" "${ssh_target}" "${bench_ref}"
-    quoted_repo_root=$(printf '%q' "${remote_repo_root}")
-    quoted_repo_url=$(printf '%q' "${remote_repo_url}")
-    quoted_bench_ref=$(printf '%q' "${bench_ref}")
-    quoted_run_parent=$(printf '%q' "${run_parent}")
-    remote_cmd=$(cat <<EOF
-set -euo pipefail
-REPO_DIR=${quoted_repo_root}
-REPO_URL=${quoted_repo_url}
-BENCH_REF=${quoted_bench_ref}
-RUN_PARENT=${quoted_run_parent}
-PARENT_DIR=\$(dirname "\$REPO_DIR")
-mkdir -p "\$PARENT_DIR"
-if [[ ! -d "\$REPO_DIR/.git" ]]; then
-    echo "Cloning ProductEngineerBench into \$REPO_DIR"
-    rm -rf "\$REPO_DIR"
-    git clone "\$REPO_URL" "\$REPO_DIR"
-fi
-cd "\$REPO_DIR"
-git fetch origin --tags --prune
-git fetch origin "\$BENCH_REF" || true
-if git rev-parse --verify --quiet "\$BENCH_REF"; then
-    git checkout --detach "\$BENCH_REF"
-elif git rev-parse --verify --quiet "origin/\$BENCH_REF"; then
-    git checkout --detach "origin/\$BENCH_REF"
-else
-    git checkout --detach "\$BENCH_REF"
-fi
-uv sync --frozen
-mkdir -p "\$RUN_PARENT"
-EOF
-)
-    ssh ${ssh_opts} "${ssh_target}" "bash -lc $(printf '%q' "${remote_cmd}")"
-fi
-
 if [[ -n "${ssh_target}" ]]; then
+    quoted_run_parent=$(printf %q "${run_parent}")
     quoted_run_dir=$(printf %q "${run_dir}")
-    ssh ${ssh_opts} "${ssh_target}" "mkdir -p ${quoted_run_dir}"
+    ssh ${ssh_opts} "${ssh_target}" "mkdir -p ${quoted_run_parent} ${quoted_run_dir}"
 else
     echo "Warning: unable to pre-create run directory ${run_dir} (no --ssh-host provided)." >&2
 fi
 
+# Stage data/config into the run directory so the container can consume them from /results.
+local_repo_config=""
+if [[ -n "${repo_name}" ]]; then
+    local_repo_config="${REPO_ROOT}/data/${repo_name}.yaml"
+else
+    # Allow relative paths from repo root
+    if [[ "${config_override}" != /* ]]; then
+        local_repo_config="${REPO_ROOT}/${config_override#./}"
+    else
+        local_repo_config="${config_override}"
+    fi
+fi
+
+if [[ ! -f "${local_repo_config}" ]]; then
+    echo "Missing repository config at ${local_repo_config}" >&2
+    exit 1
+fi
+
+local_storymachine_config="${REPO_ROOT}/config/storymachine.yaml"
+if [[ ! -f "${local_storymachine_config}" ]]; then
+    echo "Missing storymachine config at ${local_storymachine_config}" >&2
+    exit 1
+fi
+
+if [[ -z "${ssh_target}" ]]; then
+    echo "Remote staging requires --ssh-host to copy data/config to the run directory." >&2
+    exit 1
+fi
+
+remote_data_dir="${run_dir}/data"
+remote_config_dir="${run_dir}/config"
+ssh ${ssh_opts} "${ssh_target}" "mkdir -p $(printf %q "${remote_data_dir}") $(printf %q "${remote_config_dir}")"
+
+# Copy repo config and supporting data (including PRD/tech-spec files) into the run dir.
+scp ${ssh_opts} "${local_repo_config}" "${ssh_target}:$(printf %q "${remote_data_dir}/")"
+scp ${ssh_opts} "${local_storymachine_config}" "${ssh_target}:$(printf %q "${remote_config_dir}/")"
+
+local_repo_data_dir="${REPO_ROOT}/data/${repo_slug}"
+if [[ -d "${local_repo_data_dir}" ]]; then
+    scp -r ${ssh_opts} "${local_repo_data_dir}" "${ssh_target}:$(printf %q "${remote_data_dir}/")"
+else
+    echo "Warning: expected repo data directory ${local_repo_data_dir} not found; PRD/tech-spec may be missing." >&2
+fi
+
 env_args=(
-    "DATA_DIR=${remote_repo_root}/data"
-    "CONFIG_DIR=${remote_repo_root}/config"
+    "DATA_DIR=/results/data"
+    "CONFIG_DIR=/results/config"
     "RESULTS_DIR=${run_parent}"
     "BENCHMARK_IMAGE=${image_name}"
     "BENCHMARK_ENV_FILE=${remote_env_file}"
-    "BENCH_REMOTE=1"
     "SYNC_BUCKET=${bucket}"
     "SYNC_PREFIX=${s3_prefix}"
 )

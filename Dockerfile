@@ -3,7 +3,6 @@ FROM python:3.11-slim
 # Install common tools
 RUN apt-get update && apt-get install -y \
     git curl sqlite3 build-essential procps \
-    awscli \
     # for browser automation
     xvfb libx11-6 libx11-xcb1 libxcb1 libxcomposite1 libxdamage1 libxfixes3 \
     libxrandr2 libxkbcommon0 libxext6 libxshmfence1 libxss1 libxtst6 \
@@ -21,7 +20,6 @@ ARG USER_ID=1000
 RUN useradd -m -u ${USER_ID} bencher
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
     apt-get install -y nodejs
-RUN npm install -g @anthropic-ai/claude-code
 RUN npx --yes playwright@latest install --with-deps
 
 WORKDIR /home/bencher/workspace
@@ -32,8 +30,6 @@ COPY src/ src/
 COPY data/ data/
 COPY README.md .
 RUN uv sync
-
-RUN mkdir stories
 
 # Change ownership of workspace to bencher user
 RUN chown -R bencher:bencher /home/bencher && chmod -R 755 /home/bencher

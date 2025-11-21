@@ -6,6 +6,7 @@ import signal
 import subprocess
 import tempfile
 import shutil
+import time
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -231,9 +232,48 @@ class BenchmarkRunner:
         self.mark_cancelled()
         raise SystemExit(130)
 
+    def _run_command(
+        self,
+        event: str,
+        cmd: list[str],
+        *,
+        cwd: Optional[Path] = None,
+        env: Optional[Dict[str, str]] = None,
+        check: bool = True,
+    ) -> subprocess.CompletedProcess[bytes]:
+        start = time.monotonic()
+        self.logger.info(
+            f"{event}_start",
+            cmd=cmd,
+            cwd=str(cwd) if cwd else None,
+        )
+        try:
+            result = subprocess.run(cmd, cwd=cwd, env=env, check=check)
+        except subprocess.CalledProcessError as exc:
+            duration_ms = int((time.monotonic() - start) * 1000)
+            self.logger.error(
+                f"{event}_error",
+                cmd=cmd,
+                cwd=str(cwd) if cwd else None,
+                returncode=exc.returncode,
+                duration_ms=duration_ms,
+                error=str(exc),
+            )
+            raise
+        duration_ms = int((time.monotonic() - start) * 1000)
+        self.logger.info(
+            f"{event}_complete",
+            cmd=cmd,
+            cwd=str(cwd) if cwd else None,
+            returncode=result.returncode,
+            duration_ms=duration_ms,
+        )
+        return result
+
     def _checkpoint_state(self, reason: str) -> None:
         if not self.sync_client or not self.sync_prefix:
             return
+        start = time.monotonic()
         try:
             self.state.flush()
             self.state.record_checkpoint(reason, extra={"run_id": self.run_id})
@@ -242,17 +282,30 @@ class BenchmarkRunner:
                 "checkpoint_record_failed", reason=reason, error=str(exc)
             )
         try:
-            sync_prefix = self.sync_prefix or ""
-            self.sync_client.sync_directory(self.run_root, sync_prefix, delete=True)
             archive = TarArchiver.create_archive(self.run_root)
+            archive_size = archive.stat().st_size
+            archive_key = f"{(self.sync_prefix or '').rstrip('/')}.tar.gz"
+            self.logger.info(
+                "checkpoint_archive_upload_start",
+                reason=reason,
+                key=archive_key,
+                bytes=archive_size,
+            )
             try:
-                archive_key = f"{sync_prefix.rstrip('/')}.tar.gz"
                 self.sync_client.upload_file(archive, archive_key)
             finally:
                 archive.unlink(missing_ok=True)
-            self.logger.info("checkpoint_synced", reason=reason)
+            self.logger.info(
+                "checkpoint_archived",
+                reason=reason,
+                key=archive_key,
+                bytes=archive_size,
+                duration_ms=int((time.monotonic() - start) * 1000),
+            )
         except Exception as exc:
-            self.logger.warning("checkpoint_sync_failed", reason=reason, error=str(exc))
+            self.logger.warning(
+                "checkpoint_archive_failed", reason=reason, error=str(exc)
+            )
 
     def _download_resume_state(self) -> None:
         if not self.resume_prefix or not self.sync_client:
@@ -261,6 +314,7 @@ class BenchmarkRunner:
         fd, tmp_path = tempfile.mkstemp(prefix="resume_", suffix=".tar.gz")
         os.close(fd)
         archive_path = Path(tmp_path)
+        start = time.monotonic()
         try:
             self.logger.info("resume_download_start", key=archive_key)
             self.sync_client.download_file(archive_key, archive_path)
@@ -271,18 +325,22 @@ class BenchmarkRunner:
                     else:
                         child.unlink()
             TarArchiver.extract_archive(archive_path, self.run_root)
-            self.logger.info("resume_download_complete", path=str(self.run_root))
+            self.logger.info(
+                "resume_download_complete",
+                path=str(self.run_root),
+                duration_ms=int((time.monotonic() - start) * 1000),
+            )
         finally:
             archive_path.unlink(missing_ok=True)
 
     def setup_git_user(self) -> None:
-        subprocess.run(
+        self._run_command(
+            "git_config_user",
             ["git", "config", "--global", "user.name", "ProductEngineerBench"],
-            check=True,
         )
-        subprocess.run(
+        self._run_command(
+            "git_config_email",
             ["git", "config", "--global", "user.email", "benchrunner@example.com"],
-            check=True,
         )
 
     def setup_git_credentials(self) -> None:
@@ -291,8 +349,9 @@ class BenchmarkRunner:
             raise ValueError("GIT_TOKEN environment variable not set")
         git_username = os.environ.get("GIT_USERNAME", "x-access-token")
 
-        subprocess.run(
-            ["git", "config", "--global", "credential.helper", "store"], check=True
+        self._run_command(
+            "git_config_credentials",
+            ["git", "config", "--global", "credential.helper", "store"],
         )
 
         # Git expects the personal access token in the password slot.
@@ -306,6 +365,12 @@ class BenchmarkRunner:
 
     def commit_story_changes(self, story_file: str) -> Optional[str]:
         sha = self.git.commit_all(f"Implement story: {story_file}")
+        self.logger.info(
+            "git_commit_attempt",
+            story=story_file,
+            sha=sha,
+            dirty=self.git.is_dirty(),
+        )
         if sha is None:
             self.logger.warning("git_commit_failed", story=story_file)
         return sha
@@ -361,10 +426,10 @@ class BenchmarkRunner:
         script_path.write_text("\n".join(script_lines) + "\n")
         script_path.chmod(0o755)
 
-        subprocess.run(
+        self._run_command(
+            "repo_setup_script",
             ["/bin/bash", ".bench_setup.sh"],
             cwd=self.repo_dir,
-            check=True,
             env={**os.environ, **setup.get("env", {})},
         )
 
@@ -393,8 +458,8 @@ class BenchmarkRunner:
         sm_config = self.storymachine_config
         repo_cfg = self.repo_config["repository"]
 
-        prd_path = self.repo_dir / repo_cfg["prd"]
-        spec_path = self.repo_dir / repo_cfg["tech_spec"]
+        prd_path = Path(repo_cfg["prd"])
+        spec_path = Path(repo_cfg["tech_spec"])
 
         cmd = [
             "uvx",
@@ -411,7 +476,7 @@ class BenchmarkRunner:
             str(self.stories_dir),
         ]
 
-        subprocess.run(cmd, check=True)
+        self._run_command("story_generation", cmd)
 
         story_files = sorted([path.name for path in self.stories_dir.glob("*.md")])
         self.state.set_story_order(story_files)
@@ -440,9 +505,21 @@ class BenchmarkRunner:
         prompt_path = Path(__file__).parent / "prompts" / "implementation.txt"
         user_message = prompt_path.read_text().format(story=story)
         has_error = False
+        last_event_type: Optional[str] = None
+        session_start = time.monotonic()
+        self.logger.info(
+            "llm_session_start",
+            story=story_file,
+            phase="implement",
+            model=self.implementer_model,
+            base_url=base_url,
+            max_input_tokens=_env_int("MAX_INPUT_TOKENS", 100000),
+            max_output_tokens=_env_int("MAX_OUTPUT_TOKENS", 20000),
+            usage_id="implementer",
+        )
 
         def event_callback(event: Any) -> None:
-            nonlocal has_error
+            nonlocal has_error, last_event_type
             self.log_message(story_file, "implement", event)
             self.print_event_human_readable(event)
             event_dict = (
@@ -456,6 +533,7 @@ class BenchmarkRunner:
                 message = str(event_dict)
                 if "error" in message.lower():
                     has_error = True
+                last_event_type = event_dict.get("event_type") or event_dict.get("type")
 
         conversation = Conversation(
             agent=agent,
@@ -468,6 +546,15 @@ class BenchmarkRunner:
         )
         conversation.send_message(user_message)
         conversation.run()
+
+        self.logger.info(
+            "llm_session_complete",
+            story=story_file,
+            phase="implement",
+            duration_ms=int((time.monotonic() - session_start) * 1000),
+            had_error=has_error,
+            last_event_type=last_event_type,
+        )
 
         if has_error:
             raise CodeImplementationError("Code implementation failed with errors")
@@ -493,9 +580,19 @@ class BenchmarkRunner:
         prompt_path = Path(__file__).parent / "prompts" / "evaluation.txt"
         user_message = prompt_path.read_text().format(story=story)
         has_error = False
+        last_event_type: Optional[str] = None
+        session_start = time.monotonic()
+        self.logger.info(
+            "llm_session_start",
+            story=story_file,
+            phase="evaluate",
+            model=self.evaluator_model,
+            base_url=base_url,
+            usage_id="evaluator",
+        )
 
         def event_callback(event: Any) -> None:
-            nonlocal has_error
+            nonlocal has_error, last_event_type
             self.log_message(story_file, "evaluate", event)
             self.print_event_human_readable(event)
             event_dict = (
@@ -509,6 +606,7 @@ class BenchmarkRunner:
                 message = str(event_dict)
                 if "error" in message.lower():
                     has_error = True
+                last_event_type = event_dict.get("event_type") or event_dict.get("type")
 
         conversation = Conversation(
             agent=agent,
@@ -522,6 +620,15 @@ class BenchmarkRunner:
         conversation.send_message(user_message)
         conversation.run()
 
+        self.logger.info(
+            "llm_session_complete",
+            story=story_file,
+            phase="evaluate",
+            duration_ms=int((time.monotonic() - session_start) * 1000),
+            had_error=has_error,
+            last_event_type=last_event_type,
+        )
+
         if has_error:
             raise UATEvaluationError("UAT evaluation failed with errors")
 
@@ -533,7 +640,7 @@ class BenchmarkRunner:
             self.logger.info("no_stories")
             return
 
-        for story_file in story_order:
+        for idx, story_file in enumerate(story_order):
             story_path = self.stories_dir / story_file
             if not story_path.exists():
                 self.logger.warning("story_missing", story=story_file)
@@ -543,6 +650,13 @@ class BenchmarkRunner:
             phase = self._normalize_phase(story_file, status)
             if phase is None:
                 continue
+
+            self.logger.info(
+                "story_cycle_start",
+                story=story_file,
+                phase=phase.value,
+                stories_remaining=len(story_order) - idx - 1,
+            )
 
             story_text = story_path.read_text()
             phase = self._maybe_implement(story_file, story_text, phase)
@@ -587,7 +701,12 @@ class BenchmarkRunner:
         if self.skip_implement or phase not in {Phase.PENDING, Phase.IMPLEMENTING}:
             return phase
 
-        self.logger.info("story_implement_start", story=story_file)
+        impl_start = time.monotonic()
+        self.logger.info(
+            "story_implement_start",
+            story=story_file,
+            phase=phase.value,
+        )
         self.state.mark_implementing(story_file)
         before_sha = self.git.rev_parse("HEAD")
         try:
@@ -604,6 +723,13 @@ class BenchmarkRunner:
         self.state.record_commits(story_file, before=before_sha, after=after_sha)
         status = self.state.mark_evaluating(story_file)
         phase = Phase(status.get("phase", Phase.EVALUATING.value))
+        self.logger.info(
+            "story_implement_complete",
+            story=story_file,
+            before_sha=before_sha,
+            after_sha=after_sha,
+            duration_ms=int((time.monotonic() - impl_start) * 1000),
+        )
         self._checkpoint_state(f"{story_file}-implement-committed")
         return phase
 
@@ -636,7 +762,8 @@ class BenchmarkRunner:
         }:
             return
 
-        self.logger.info("story_evaluate_start", story=story_file)
+        eval_start = time.monotonic()
+        self.logger.info("story_evaluate_start", story=story_file, phase=phase.value)
         try:
             self.evaluate_acceptance_criteria(story_text, story_file)
         except UATEvaluationError as exc:
@@ -657,6 +784,11 @@ class BenchmarkRunner:
                 "Result: Success\n\nNo detailed report provided.",
             )
         self.state.mark_completed(story_file)
+        self.logger.info(
+            "story_evaluate_complete",
+            story=story_file,
+            duration_ms=int((time.monotonic() - eval_start) * 1000),
+        )
         self._checkpoint_state(f"{story_file}-evaluate-completed")
 
     def log_message(self, story_file: str, phase: str, event: Any) -> None:
@@ -725,13 +857,26 @@ class BenchmarkRunner:
 
     def execute(self) -> None:
         self.logger.info("repo_setup_start")
+        start = time.monotonic()
         self.setup_repository()
+        self.logger.info(
+            "repo_setup_complete", duration_ms=int((time.monotonic() - start) * 1000)
+        )
 
         self.logger.info("story_generation_start")
+        start = time.monotonic()
         self.generate_stories()
+        self.logger.info(
+            "story_generation_complete",
+            duration_ms=int((time.monotonic() - start) * 1000),
+        )
 
         self.logger.info("benchmark_start")
+        start = time.monotonic()
         self.run_benchmark()
+        self.logger.info(
+            "benchmark_complete", duration_ms=int((time.monotonic() - start) * 1000)
+        )
 
     def finalize(self) -> None:
         if self.sync_enabled:

@@ -22,10 +22,6 @@ class Phase(Enum):
 
 
 class SyncClient(Protocol):
-    def sync_directory(
-        self, source: Path, destination: str, delete: bool = False
-    ) -> None: ...
-
     def upload_file(self, source: Path, destination: str) -> None: ...
 
     def download_file(self, source: str, destination: Path) -> None: ...
@@ -77,29 +73,6 @@ class S3SyncClient:
     def _dest_path(bucket: str, prefix: str) -> str:
         clean = prefix.lstrip("/")
         return f"{bucket}/{clean}" if clean else bucket
-
-    def sync_directory(
-        self, source: Path, destination: str, delete: bool = False
-    ) -> None:
-        dest = self._dest_path(self.bucket, destination)
-        # s3fs put is recursive when given a directory.
-        self.fs.put(str(source), dest, recursive=True)
-        if delete:
-            self._delete_extraneous(source, dest)
-
-    def _delete_extraneous(self, local_root: Path, remote_root: str) -> None:
-        # Best-effort deletion to mimic prior --delete semantics.
-        local_files = {
-            str(p.relative_to(local_root)) for p in local_root.rglob("*") if p.is_file()
-        }
-        remote_files = set(self.fs.find(remote_root))
-        for remote_file in remote_files:
-            try:
-                rel = Path(remote_file).relative_to(remote_root)
-            except ValueError:
-                continue
-            if str(rel) not in local_files:
-                self.fs.rm(remote_file)
 
     def upload_file(self, source: Path, destination: str) -> None:
         dest = self._dest_path(self.bucket, destination)

@@ -137,6 +137,14 @@ Key sections:
 4. Delegate implementation & evaluation to LLM agents via Openhands SDK.
 5. Save results, logs, and intermediate artifacts to `/results` (mounted from host).
 
+### Logging and observability
+
+- Structured logs are emitted with `structlog`; switch to JSON via `LOG_FORMAT=json` (default is console renderer).
+- Canonical events now include phase timing: `repo_setup_{start,complete}`, `story_generation_{start,complete}`, `benchmark_{start,complete}`, `story_implement_{start,complete}`, and `story_evaluate_{start,complete}` — each carries `duration_ms` and the `story` where applicable.
+- External commands log start/complete/error with `cmd`, `cwd`, `returncode`, and `duration_ms` (`*_start|complete|error`).
+- LLM sessions log `llm_session_start/complete` with `model`, optional `base_url`, `max_*_tokens`, `phase`, and `had_error`; event payloads are not included to avoid leaking prompts.
+- Checkpoints and resume activity log archive keys/sizes and durations under `checkpoint_*` and `resume_download_*` events to aid S3 troubleshooting.
+
 Useful artifacts produced per story:
 
 - `<story>.implement.jsonl` / `<story>.evaluate.jsonl`: Streaming agent event transcripts.

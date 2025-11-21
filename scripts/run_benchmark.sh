@@ -83,6 +83,12 @@ if [[ "${docker_context}" != "default" ]] || [[ "${BENCH_REMOTE}" == "1" ]]; the
     remote_mode=1
 fi
 
+if (( remote_mode )); then
+    # Remote runs consume staged data/config inside the results mount.
+    DATA_DIR="/results/data"
+    CONFIG_DIR="/results/config"
+fi
+
 env_file=${BENCHMARK_ENV_FILE:-}
 if [[ -z "${env_file}" ]]; then
     if (( remote_mode )) && [[ -f "${REPO_ROOT}/.env.remote" ]]; then
@@ -184,8 +190,15 @@ for repo_data in "${repo_files[@]}"; do
     run_index=$((run_index + 1))
     repo_filename=$(basename -- "${repo_data}")
     repo_name="${repo_filename%.yaml}"
-    data_mount_source=$(dirname -- "${repo_data}")
-    container_data_root="/data"
+
+    if (( remote_mode )); then
+        container_data_root="${DATA_DIR%/}"
+        container_config_root="${CONFIG_DIR%/}"
+    else
+        data_mount_source=$(dirname -- "${repo_data}")
+        container_data_root="/data"
+        container_config_root="/config"
+    fi
 
     if (( manage_local_paths )) && [[ ! -f "${repo_data}" ]]; then
         echo "Missing repository config ${repo_data}" >&2
@@ -211,15 +224,25 @@ for repo_data in "${repo_files[@]}"; do
 
     docker_args=(
         "--rm"
-        "-v" "${data_mount_source}:${container_data_root}:ro"
-        "-v" "${CONFIG_DIR}:/config:ro"
-        "-v" "${run_dir}:/results"
-        "-e" "REPO_CONFIG=${container_data_root}/${repo_filename}"
-        "-e" "STORYMACHINE_CONFIG=/config/storymachine.yaml"
-        "-e" "RESULTS_DIR=/results"
-        "-e" "RUN_DIR=/results"
-        "-e" "RUN_ID=$(basename "${run_dir}")"
-    )
+            "-v" "${run_dir}:/results"
+            "-e" "REPO_CONFIG=${container_data_root}/${repo_filename}"
+            "-e" "STORYMACHINE_CONFIG=${container_config_root}/storymachine.yaml"
+            "-e" "RESULTS_DIR=/results"
+            "-e" "RUN_DIR=/results"
+            "-e" "RUN_ID=$(basename "${run_dir}")"
+        )
+
+    if (( remote_mode )); then
+        docker_args+=(
+            "-v" "${run_dir}/data:/data:ro"
+            "-v" "${run_dir}/config:/config:ro"
+        )
+    else
+        docker_args+=(
+            "-v" "${data_mount_source}:${container_data_root}:ro"
+            "-v" "${CONFIG_DIR}:${container_config_root}:ro"
+        )
+    fi
 
     if (( remote_mode )); then
         docker_args+=("--sig-proxy=false")
@@ -241,9 +264,13 @@ for repo_data in "${repo_files[@]}"; do
         fi
     done
 
-    if [[ -n "${env_file}" && -f "${env_file}" ]]; then
-        docker_args+=("--env-file" "${env_file}")
+if [[ -n "${env_file}" && -f "${env_file}" ]]; then
+    docker_args+=("--env-file" "${env_file}")
+else
+    if [[ -n "${env_file}" ]]; then
+        echo "Warning: BENCHMARK_ENV_FILE set but not found locally (${env_file}); not passing --env-file." >&2
     fi
+fi
 
     if (( remote_mode )); then
         if [[ -n "${BENCH_AWS_DIR}" ]]; then
