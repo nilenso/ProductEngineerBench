@@ -15,6 +15,23 @@ class _DummyGit:
         self.calls.append(f"rev_parse:{ref}")
         return "before-sha"
 
+    # Protocol compatibility stubs
+    def fetch_all(self) -> None:  # pragma: no cover - not used in these tests
+        self.calls.append("fetch_all")
+
+    def checkout(self, branch: str, ref: str | None = None) -> None:  # pragma: no cover
+        self.calls.append(f"checkout:{branch}:{ref}")
+
+    def reset_hard(self, ref: str) -> None:  # pragma: no cover
+        self.calls.append(f"reset_hard:{ref}")
+
+    def clone(self, url: str, target: Path) -> None:  # pragma: no cover
+        self.calls.append(f"clone:{url}:{target}")
+
+    def has_changes(self) -> bool:  # pragma: no cover
+        self.calls.append("has_changes")
+        return True
+
     def commit_all(self, message: str) -> str:
         self.calls.append(f"commit:{message}")
         return "after-sha"

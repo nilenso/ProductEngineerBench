@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import os
 import logging
+import os
+import shutil
 import signal
 import subprocess
 import tempfile
-import shutil
 import time
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
@@ -18,7 +18,7 @@ from openhands.sdk import LLM, Conversation
 from openhands.tools.preset.default import get_default_agent
 from pydantic import SecretStr
 
-from .clients import Phase, S3SyncClient, SubprocessGitClient, TarArchiver
+from .clients import GitClient, Phase, S3SyncClient, SubprocessGitClient, TarArchiver
 from .config import load_repo_settings, load_storymachine_settings
 from .state import RunState
 
@@ -131,7 +131,7 @@ class BenchmarkRunner:
 
         self.repo_dir = self.state.repo_dir
         self.stories_dir = self.state.stories_dir
-        self.git = SubprocessGitClient(self.repo_dir)
+        self.git: GitClient = SubprocessGitClient(self.repo_dir)
 
         self.implementer_model = os.environ.get("IMPLEMENTER_MODEL", "claude-haiku-4-5")
         self.evaluator_model = os.environ.get("EVALUATOR_MODEL", "claude-sonnet-4-5")
@@ -369,7 +369,7 @@ class BenchmarkRunner:
             "git_commit_attempt",
             story=story_file,
             sha=sha,
-            dirty=self.git.is_dirty(),
+            dirty=self.git.has_changes() if hasattr(self.git, "has_changes") else None,
         )
         if sha is None:
             self.logger.warning("git_commit_failed", story=story_file)
