@@ -1,0 +1,29 @@
+<task>
+Perform user acceptance tests to confirm if the code meets all the given acceptance criteria for the given story.
+
+{story}
+
+Provide the results with commentary for each criteria in result.md.
+</task>
+
+<evaluation_methodology>
+- You will evaluate like a User Acceptance Tester, which means you run the application and test it against the acceptance criteria in a black-box way.
+- You are expected to write automation scripts to help you test the application. It must resemble how a real user would interact with the application—for example, to test a web app, prefer using Playwright (or any other browser-based frameworks).
+- You are allowed to read code to figure out how to write the tests, but you are NOT allowed to change the code to fix bugs.
+- You are NOT allowed to adjust the tests to adapt to bugs in the application.
+- If the code does not run successfully, refer to the README.md for setup instructions. If you are unable to get the code running, the result is a fail.
+- The result is a fail if there are bugs in the application that prevent it functioning as intended.
+- The result is a fail if any acceptance criteria are not met.
+- The result is a pass if all acceptance criteria are met.
+</evaluation_methodology>
+
+<constraints>
+You must adhere to the result format presented below.
+
+<result_format>
+Result: Pass | Fail
+
+Commentary:
+[commentary goes here. Justify why the result is a pass or fail.]
+</result_format>
+</constraints>

@@ -1,0 +1,78 @@
+from pathlib import Path
+
+import structlog
+
+from productengineerbench.clients import Phase
+from productengineerbench.runner import BenchmarkRunner
+from productengineerbench.state import RunState
+
+
+class _DummyGit:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def rev_parse(self, ref: str = "HEAD") -> str:
+        self.calls.append(f"rev_parse:{ref}")
+        return "before-sha"
+
+    # Protocol compatibility stubs
+    def fetch_all(self) -> None:  # pragma: no cover - not used in these tests
+        self.calls.append("fetch_all")
+
+    def checkout(self, branch: str, ref: str | None = None) -> None:  # pragma: no cover
+        self.calls.append(f"checkout:{branch}:{ref}")
+
+    def reset_hard(self, ref: str) -> None:  # pragma: no cover
+        self.calls.append(f"reset_hard:{ref}")
+
+    def clone(self, url: str, target: Path) -> None:  # pragma: no cover
+        self.calls.append(f"clone:{url}:{target}")
+
+    def has_changes(self) -> bool:  # pragma: no cover
+        self.calls.append("has_changes")
+        return True
+
+    def commit_all(self, message: str) -> str:
+        self.calls.append(f"commit:{message}")
+        return "after-sha"
+
+
+def test_maybe_implement_skipped_marks_evaluating(tmp_path: Path) -> None:
+    state = RunState(tmp_path, {}, {}, resume=False, force_resume=False)
+    runner = object.__new__(BenchmarkRunner)
+    runner.logger = structlog.get_logger("test")
+    runner.state = state
+    runner.skip_implement = True
+    runner.evaluate_if_result_present = False
+    runner.git = _DummyGit()
+    runner._checkpoint_state = lambda *_args, **_kwargs: None
+
+    phase = BenchmarkRunner._maybe_implement(runner, "story.md", "text", Phase.PENDING)
+
+    assert phase is Phase.EVALUATING
+    status = state.ensure_story_status("story.md")
+    assert status["phase"] == "evaluating"
+
+
+def test_maybe_implement_records_commits(tmp_path: Path) -> None:
+    state = RunState(tmp_path, {}, {}, resume=False, force_resume=False)
+    runner = object.__new__(BenchmarkRunner)
+    runner.logger = structlog.get_logger("test")
+    runner.state = state
+    runner.skip_implement = False
+    runner.evaluate_if_result_present = False
+    runner.git = _DummyGit()
+    runner._checkpoint_state = lambda *_args, **_kwargs: None
+
+    def fake_impl(_story_text: str, _story_file: str) -> None:  # noqa: ANN001
+        return None
+
+    runner.implement_story = fake_impl  # type: ignore[assignment]
+    runner.commit_story_changes = lambda sf: "after-sha"  # type: ignore[assignment]
+
+    phase = BenchmarkRunner._maybe_implement(runner, "story.md", "text", Phase.PENDING)
+
+    assert phase is Phase.EVALUATING
+    status = state.ensure_story_status("story.md")
+    assert status["commits"]["before"] == "before-sha"
+    assert status["commits"]["after_implement"] == "after-sha"
