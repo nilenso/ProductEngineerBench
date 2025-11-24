@@ -1,0 +1,39 @@
+[project]
+name = "productengineerbench"
+version = "0.1.0"
+description = "A useful coding benchmark."
+readme = "README.md"
+authors = [
+    { name = "Atharva Raykar", email = "atharva@nilenso.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "openhands-sdk",
+    "openhands-tools",
+    "pydantic-settings>=2.11.0",
+    "s3fs>=2025.10.0",
+    "structlog>=25.5.0",
+]
+
+[project.scripts]
+productengineerbench = "productengineerbench.runner:run"
+
+[build-system]
+requires = ["uv_build>=0.8.19,<0.9.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "marimo>=0.16.1",
+    "openai>=1.99.9",
+    "pyright>=1.1.407",
+    "pytest>=9.0.1",
+    "ruff>=0.13.1",
+]
+
+[tool.marimo.language_servers.pylsp]
+enabled = true
+enable_ruff = true
+
+[tool.marimo.diagnostics]
+enabled = true
