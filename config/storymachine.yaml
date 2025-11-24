@@ -1,0 +1,2 @@
+package: "git+https://github.com/nilenso/storymachine"
+version: "context-enhanced-stories-codex-impl"
